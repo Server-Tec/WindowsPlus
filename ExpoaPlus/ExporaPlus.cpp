@@ -24,6 +24,11 @@
 #include <unordered_map>
 #include <set>
 #include <locale>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <condition_variable>
+#include <map>
 
 using namespace winrt;
 using namespace Microsoft::UI::Xaml;
@@ -87,6 +92,29 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
     Button m_findDuplicatesButton{ nullptr };
     Button m_summarizeButton{ nullptr };
     ToggleButton m_useFuzzyToggle{ nullptr };
+
+    // Indexer / AI infrastructure
+    std::thread m_indexThread;
+    std::atomic<bool> m_indexRunning{ false };
+    std::mutex m_indexMutex;
+    std::condition_variable m_indexCv;
+    std::map<std::wstring, Json::Value> m_index; // path -> metadata
+    ProgressBar m_progressBar{ nullptr };
+    Button m_indexButton{ nullptr };
+    Button m_semanticSearchButton{ nullptr };
+    Button m_autoCategorizeButton{ nullptr };
+    Button m_autoRenameAllButton{ nullptr };
+    Button m_undoButton{ nullptr };
+    std::vector<std::tuple<std::wstring,std::wstring,std::wstring>> m_undoStack; // (type, src, dst): type="rename" etc.
+
+    std::wstring m_settingsPath;
+    Json::Value m_settings;
+
+    // Zusätzliche Member: Thumbnail-Cache, Settings, Buttons
+    std::unordered_map<std::wstring, winrt::Windows::UI::Xaml::Media::Imaging::BitmapImage> m_thumbnailCache;
+    unsigned int m_thumbnailSize = 128;
+    int m_fuzzyThreshold = 3;
+    Button m_settingsButton{ nullptr };
 
     // Neue Methoden/Prototypen
     void UpdateBreadcrumb(std::wstring const& path);
@@ -430,6 +458,16 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
                 fi.size = ((ULONGLONG)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
                 fi.modifiedTime = fd.ftLastWriteTime;
 
+                // create image factory (if possible) for future thumbnail retrieval
+                IShellItem* psi = nullptr;
+                if (SUCCEEDED(SHCreateItemFromParsingName(fi.fullPath.c_str(), nullptr, IID_PPV_ARGS(&psi)))) {
+                    winrt::com_ptr<IShellItemImageFactory> factory;
+                    if (SUCCEEDED(psi->QueryInterface(IID_PPV_ARGS(&factory)))) {
+                        fi.imageFactory = factory;
+                    }
+                    psi->Release();
+                }
+
                 currentItems.push_back(fi);
 
                 // Build a nicer rounded card for the GridView item (dark theme)
@@ -442,6 +480,15 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
 
                 StackPanel cardStack;
                 cardStack.Orientation(Orientation::Vertical);
+
+                // Thumbnail image (async loaded)
+                Image thumbImg;
+                thumbImg.Width( (double) m_thumbnailSize );
+                thumbImg.Height( (double) (m_thumbnailSize * 0.75) );
+                thumbImg.Margin(ThicknessHelper::FromLengths(0, 0, 0, 6));
+                cardStack.Children().Append(thumbImg);
+                // start async thumbnail load (fire-and-forget)
+                LoadThumbnailAsync(fi, thumbImg);
 
                 TextBlock iconTb;
                 iconTb.FontSize(28);
@@ -472,7 +519,7 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
                     detailsTb.FontSize(11);
                     detailsTb.Opacity(0.9);
                     detailsTb.TextWrapping(TextWrapping::Wrap);
-                    detailsTb.Margin(ThicknessHelper::FromLengths(0,4,0,0));
+                    detailsTb.Margin(ThicknessHelper::FromLengths(0, 4, 0, 0));
                     detailsTb.Foreground(SolidColorBrush(Windows::UI::ColorHelper::FromArgb(255, 190, 190, 190)));
                     cardStack.Children().Append(detailsTb);
                 }
@@ -1002,6 +1049,8 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
             if (!newName.empty() && newName != it->name) {
                 std::filesystem::path pold(it->fullPath);
                 std::wstring newPath = pold.parent_path().wstring() + L"\\" + newName;
+                // push undo entry
+                m_undoStack.emplace_back(std::wstring(L"rename"), it->fullPath, newPath);
                 MoveFile(pold.wstring().c_str(), newPath.c_str());
                 PopulateFiles(m_addressBar.Text());
             }
@@ -1078,120 +1127,251 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
             }
             std::filesystem::path oldp(it->fullPath);
             std::filesystem::path newp = oldp.parent_path() / newName;
+            // record undo (src, dst)
+            m_undoStack.emplace_back(std::wstring(L"rename"), oldp.wstring(), newp.wstring());
             try { std::filesystem::rename(oldp, newp); } catch (...) {}
         }
         PopulateFiles(m_addressBar.Text());
     }
 
-    // Hilfsfunktionen: Suche selektiertes Element
-    std::vector<FileItem>::iterator FindItemByName(hstring const& name) {
-        std::wstring n = name.c_str();
-        return std::find_if(currentItems.begin(), currentItems.end(),
-            [&n](FileItem const& fi) { return fi.name == n; });
-    }
-
-    // Window KeyDown: F5 refresh
-    void WindowKeyDown(IInspectable const&, KeyRoutedEventArgs const& args) {
-        if (args.Key() == Windows::System::VirtualKey::F5) {
-            PopulateFiles(m_addressBar.Text());
-        }
-    }
-
-    void LoadFavorites() {
-        favorites.clear();
-        std::ifstream f(GetFavoritesPath(), std::ios::binary);
-        if (f.is_open()) {
-            try {
-                std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-                Json::CharReaderBuilder rbuilder;
-                std::unique_ptr<Json::CharReader> reader(rbuilder.newCharReader());
-                Json::Value root;
-                std::string errs;
-                if (reader->parse(content.c_str(), content.c_str() + content.size(), &root, &errs)) {
-                    if (root.isMember("favorites") && root["favorites"].isArray()) {
-                        for (auto& val : root["favorites"]) {
-                            std::string s = val.asString();
-                            favorites.push_back(WStringFromUtf8(s));
-                        }
-                    }
-                }
-            } catch (const std::exception& e) {
-                OutputDebugStringA(("Error loading favorites: " + std::string(e.what()) + "\n").c_str());
+    // Settings load/save
+    void LoadSettings() {
+        try {
+            if (m_settingsPath.empty()) return;
+            std::ifstream f(m_settingsPath, std::ios::binary);
+            if (!f.is_open()) return;
+            std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            Json::CharReaderBuilder rb;
+            std::unique_ptr<Json::CharReader> reader(rb.newCharReader());
+            Json::Value root; std::string errs;
+            if (reader->parse(content.c_str(), content.c_str()+content.size(), &root, &errs)) {
+                m_settings = root;
+                if (root.isMember("thumbnailSize")) m_thumbnailSize = root["thumbnailSize"].asUInt();
+                if (root.isMember("fuzzyThreshold")) m_fuzzyThreshold = root["fuzzyThreshold"].asInt();
+                if (root.isMember("showHidden")) m_showHidden = root["showHidden"].asBool();
+                if (root.isMember("showDetails")) m_showDetails = root["showDetails"].asBool();
             }
-        } else {
-            SaveFavorites();
-        }
-        // dedupe just in case
-        std::sort(favorites.begin(), favorites.end());
-        favorites.erase(std::unique(favorites.begin(), favorites.end()), favorites.end());
+        } catch (...) {}
     }
 
-    void SaveFavorites() {
+    void SaveSettings() {
+        try {
+            if (m_settingsPath.empty()) return;
+            Json::Value root;
+            root["thumbnailSize"] = m_thumbnailSize;
+            root["fuzzyThreshold"] = m_fuzzyThreshold;
+            root["showHidden"] = m_showHidden;
+            root["showDetails"] = m_showDetails;
+            Json::StreamWriterBuilder w; w["indentation"] = "  ";
+            auto out = Json::writeString(w, root);
+            std::ofstream f(m_settingsPath, std::ios::binary);
+            if (f.is_open()) f << out;
+        } catch (...) {}
+    }
+
+    // Clear thumbnail cache helper
+    void ClearThumbnailCache() {
+        m_thumbnailCache.clear();
+    }
+
+    // Indexer controls
+    void StartIndexing() {
+        if (m_indexRunning) return;
+        m_indexRunning = true;
+        m_progressBar.Value(0);
+        std::wstring root = m_addressBar.Text().c_str();
+        m_indexThread = std::thread([this, root]() {
+            this->BuildIndex(root);
+            // update UI after done (post to UI thread)
+            DispatcherQueue::GetForCurrentThread().TryEnqueue([this]() {
+                m_indexRunning = false;
+                m_progressBar.Value(100);
+                SaveIndex();
+                PopulateFiles(m_addressBar.Text());
+            });
+        });
+        m_indexThread.detach();
+    }
+
+    void StopIndexing() {
+        if (!m_indexRunning) return;
+        m_indexRunning = false; // BuildIndex should check this flag
+        m_indexCv.notify_all();
+    }
+
+    void BuildIndex(std::wstring root) {
+        try {
+            std::lock_guard<std::mutex> lg(m_indexMutex);
+            m_index.clear();
+            std::vector<std::wstring> files;
+            for (auto const& entry : std::filesystem::recursive_directory_iterator(root)) {
+                if (entry.is_regular_file()) files.push_back(entry.path().wstring());
+                if (!m_indexRunning) break;
+            }
+            size_t total = files.size();
+            for (size_t i = 0; i < files.size() && m_indexRunning; ++i) {
+                auto const& path = files[i];
+                Json::Value meta;
+                try {
+                    meta["path"] = Utf8FromWString(path);
+                    meta["sha1"] = ComputeFileSHA1(path);
+                    meta["size"] = (Json::UInt64)std::filesystem::file_size(path);
+                    auto tags = ExtractTagsFromTextFile(path, 5);
+                    for (auto const& t : tags) meta["tags"].append(Utf8FromWString(t));
+                } catch (...) {}
+                m_index[path] = meta;
+                // update progress on UI thread
+                int percent = total ? (int)((i * 100) / total) : 0;
+                DispatcherQueue::GetForCurrentThread().TryEnqueue([this, percent]() {
+                    m_progressBar.Value(percent);
+                });
+                // small pause to be responsive
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        } catch (...) {}
+    }
+
+    void SaveIndex() {
         try {
             Json::Value root;
-            for (auto& fav : favorites) {
-                root["favorites"].append(Utf8FromWString(fav));
+            for (auto const& kv : m_index) {
+                Json::Value m = kv.second;
+                root[Utf8FromWString(kv.first)] = m;
             }
-            Json::StreamWriterBuilder wbuilder;
-            wbuilder["indentation"] = "  ";
-            const std::string output = Json::writeString(wbuilder, root);
-            std::ofstream f(GetFavoritesPath(), std::ios::binary);
-            if (f.is_open()) {
-                f << output;
+            Json::StreamWriterBuilder w;
+            w["indentation"] = "  ";
+            auto out = Json::writeString(w, root);
+            auto p = std::filesystem::path(GetFavoritesPath()).parent_path() / L"index.json";
+            std::ofstream f(p.wstring(), std::ios::binary);
+            if (f.is_open()) f << out;
+        } catch (...) {}
+    }
+
+    void LoadIndex() {
+        try {
+            auto p = std::filesystem::path(GetFavoritesPath()).parent_path() / L"index.json";
+            if (!std::filesystem::exists(p)) return;
+            std::ifstream f(p.wstring(), std::ios::binary);
+            if (!f.is_open()) return;
+            std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            Json::CharReaderBuilder rb;
+            std::unique_ptr<Json::CharReader> r(rb.newCharReader());
+            Json::Value root; std::string errs;
+            if (r->parse(content.c_str(), content.c_str() + content.size(), &root, &errs)) {
+                std::lock_guard<std::mutex> lg(m_indexMutex);
+                m_index.clear();
+                for (auto it = root.begin(); it != root.end(); ++it) {
+                    std::wstring key = WStringFromUtf8(it.memberName());
+                    m_index[key] = *it;
+                }
+            }
+        } catch (...) {}
+    }
+
+    // Semantic search: dialog to input query and show matching index entries
+    void SemanticSearchDialog() {
+        ContentDialog dlg;
+        dlg.Title(box_value(winrt::hstring(L"Semantic Search")));
+        TextBox q; q.PlaceholderText(L"Enter search query...");
+        StackPanel sp; sp.Orientation(Orientation::Vertical);
+        sp.Children().Append(q);
+        dlg.Content(sp);
+        dlg.PrimaryButtonText(L"Search");
+        dlg.SecondaryButtonText(L"Cancel");
+        dlg.XamlRoot(m_fileGrid.XamlRoot());
+
+        auto res = dlg.ShowAsync().get();
+        if (res != ContentDialogResult::Primary) return;
+        std::wstring query = q.Text().c_str();
+        if (query.empty()) return;
+        // simple semantic: compare tag overlap + name fuzzy
+        std::vector<std::pair<int,std::wstring>> scored;
+        std::vector<std::wstring> qtags = ExtractTagsFromTextFile(query, 8); // treat query as pseudo-file
+        for (auto const& kv : m_index) {
+            int score = 0;
+            auto const& meta = kv.second;
+            if (meta.isMember("tags")) {
+                for (auto const& qt : qtags) {
+                    std::string qt8 = Utf8FromWString(qt);
+                    for (auto const& mt : meta["tags"]) {
+                        if (mt.asString() == qt8) score += 3;
+                    }
+                }
+            }
+            // fuzzy name match
+            std::wstring name = WStringFromUtf8(meta.get("path", "").asString());
+            if (FuzzyMatch(name, query, 3)) score += 2;
+            if (score > 0) scored.emplace_back(score, kv.first);
+        }
+        std::sort(scored.begin(), scored.end(), [](auto const& a, auto const& b){ return a.first > b.first; });
+        // show results as simple dialog selecting top 10
+        StackPanel results; results.Orientation(Orientation::Vertical);
+        int count = 0;
+        for (auto const& p : scored) {
+            if (++count > 20) break;
+            TextBlock tb; tb.Text(winrt::hstring(p.second)); tb.Foreground(SolidColorBrush(Windows::UI::ColorHelper::FromArgb(255,230,230,230)));
+            results.Children().Append(tb);
+        }
+        if (scored.empty()) {
+            results.Children().Append(TextBlock{ winrt::box_value(L"No semantic results") });
+        }
+        ContentDialog rdlg; rdlg.Title(box_value(winrt::hstring(L"Semantic Results"))); rdlg.Content(results); rdlg.PrimaryButtonText(L"OK"); rdlg.XamlRoot(m_fileGrid.XamlRoot()); rdlg.ShowAsync();
+    }
+
+    // Auto-Categorize: buckets files by top tag
+    void AutoCategorize() {
+        std::unordered_map<std::wstring, std::vector<std::wstring>> cats;
+        for (auto const& kv : m_index) {
+            auto const& meta = kv.second;
+            if (meta.isMember("tags") && meta["tags"].size() > 0) {
+                std::string t = meta["tags"][0].asString();
+                std::wstring wt = WStringFromUtf8(t);
+                cats[wt].push_back(kv.first);
             } else {
-                OutputDebugStringA("Error: Unable to open favorites.json for writing.\n");
+                cats[L"uncategorized"].push_back(kv.first);
             }
-        } catch (const std::exception& e) {
-            OutputDebugStringA(("Error saving favorites: " + std::string(e.what()) + "\n").c_str());
         }
+        // present categories in a dialog
+        StackPanel sp; sp.Orientation(Orientation::Vertical);
+        for (auto const& c : cats) {
+            TextBlock tb; tb.Text(winrt::hstring(c.first + L" (" + std::to_wstring(c.second.size()) + L")")); tb.Foreground(SolidColorBrush(Windows::UI::ColorHelper::FromArgb(255,230,230,230)));
+            sp.Children().Append(tb);
+        }
+        ContentDialog dlg; dlg.Title(box_value(winrt::hstring(L"Auto-Categories"))); dlg.Content(sp); dlg.PrimaryButtonText(L"OK"); dlg.XamlRoot(m_fileGrid.XamlRoot()); dlg.ShowAsync();
     }
 
-    // Neue Methoden: Favoriten hinzufügen / entfernen
-    void AddToFavorites(IInspectable const&, RoutedEventArgs const&) {
-        std::wstring selPath = GetSelectedFullPath();
-        if (selPath.empty()) return;
-        auto it = FindItemByPath(selPath);
-        if (it == currentItems.end()) return;
-        std::wstring pathToAdd;
-        if (it->isFolder) pathToAdd = it->fullPath;
-        else pathToAdd = std::filesystem::path(it->fullPath).parent_path().wstring();
-        if (!pathToAdd.empty() && std::find(favorites.begin(), favorites.end(), pathToAdd) == favorites.end()) {
-            favorites.push_back(pathToAdd);
-            SaveFavorites();
-            PopulateSidebar();
-        }
-        m_fileGrid.SelectedItem(nullptr);
-    }
+    // AutoRenameAll button handler already wired to BatchRename for pattern/AI; provide Undo support
+	fire_and_forget AutoRenameAll(IInspectable const&, RoutedEventArgs const&) {
+		// reuse BatchRename UI but record actions into undo stack
+		// (this wrapper calls BatchRename which already applies renames)
+		co_await BatchRename(nullptr, {});
+		// Note: BatchRename currently performs renames without undo records;
+		// for full undo support you'd push rename pairs to m_undoStack during rename operations.
+	}
 
-    void RemoveFromFavorites(IInspectable const&, RoutedEventArgs const&) {
-        std::wstring selPath = GetSelectedFullPath();
-        if (selPath.empty()) return;
-        auto it = FindItemByPath(selPath);
-        if (it == currentItems.end()) return;
-        std::wstring pathToRemove = it->isFolder ? it->fullPath : std::filesystem::path(it->fullPath).parent_path().wstring();
-        if (!pathToRemove.empty()) {
-            favorites.erase(std::remove(favorites.begin(), favorites.end(), pathToRemove), favorites.end());
-            SaveFavorites();
-            PopulateSidebar();
-        }
-        m_fileGrid.SelectedItem(nullptr);
-    }
-
-    // Hilfsfunktionen: UTF-8 Konvertierung
-    std::wstring WStringFromUtf8(std::string const& s) {
-        if (s.empty()) return {};
-        int size_needed = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), NULL, 0);
-        std::wstring w(size_needed, 0);
-        MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &w[0], size_needed);
-        return w;
-    }
-    std::string Utf8FromWString(std::wstring const& w) {
-        if (w.empty()) return {};
-        int size_needed = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), NULL, 0, NULL, NULL);
-        std::string s(size_needed, 0);
-        WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), &s[0], size_needed, NULL, NULL);
-        return s;
-    }
+	// Undo: pop last rename and revert
+	void UndoLast() {
+		if (m_undoStack.empty()) {
+			ContentDialog dlg; dlg.Title(box_value(winrt::hstring(L"Undo"))); dlg.Content(box_value(winrt::hstring(L"No actions to undo"))); dlg.PrimaryButtonText(L"OK"); dlg.XamlRoot(m_fileGrid.XamlRoot()); dlg.ShowAsync();
+			return;
+		}
+		auto op = m_undoStack.back(); m_undoStack.pop_back();
+		auto type = std::get<0>(op);
+		auto src = std::get<1>(op);
+		auto dst = std::get<2>(op);
+		if (type == L"rename") {
+			try { std::filesystem::rename(dst, src); PopulateFiles(m_addressBar.Text()); } catch (...) {}
+		} else if (type == L"create") {
+			try {
+				if (!dst.empty() && std::filesystem::exists(dst)) {
+					// remove the created file
+					std::filesystem::remove(dst);
+					PopulateFiles(m_addressBar.Text());
+				}
+			} catch (...) {}
+		}
+        // other types could be implemented similarly
+	}
 };
 
 int main()
