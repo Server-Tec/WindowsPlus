@@ -1,4 +1,4 @@
-// WinNotePlus_Full.cpp — Win32 single-file editor: Tabs + Sidebar + Autosave + simple Syntax Highlighting + Zoom + Font selection
+// WinNotePlus_Full.cpp ï¿½ Win32 single-file editor: Tabs + Sidebar + Autosave + simple Syntax Highlighting + Zoom + Font selection
 // Features implemented:
 // - Left sidebar (TreeView) listing open files and allowing open/close operations
 // - TabControl with one RichEdit per tab (native, multiple documents)
@@ -24,6 +24,8 @@
 #include <sstream>
 #include <chrono>
 #include <thread>
+#include <algorithm>   // <-- neu: std::min/std::max
+#include <cwctype>     // <-- neu: iswalpha/iswalnum fÃ¼r Wide-char Tests
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "comdlg32.lib")
@@ -89,6 +91,32 @@ static bool WriteFileAll(const std::wstring& path, const std::vector<unsigned ch
     if (!out) return false;
     if (!data.empty()) out.write((const char*)data.data(), data.size());
     return true;
+}
+
+// Neue: Hilfsstruktur + Callbacks fÃ¼r EM_STREAMIN/OUT (vermeidet statische Offsets in Lambdas)
+struct StreamCookieIn {
+	const std::vector<unsigned char>* data;
+	size_t pos;
+};
+static DWORD CALLBACK RichEdit_StreamInCallback(DWORD_PTR dwCookie, LPBYTE pbBuff, LONG cb, LONG* pcb) {
+	StreamCookieIn* sc = (StreamCookieIn*)dwCookie;
+	if (!sc || !sc->data || pcb == nullptr) { if (pcb) *pcb = 0; return 1; }
+	size_t available = sc->data->size() > sc->pos ? sc->data->size() - sc->pos : 0;
+	size_t tocopy = std::min<size_t>(available, (size_t)cb);
+	if (tocopy) memcpy(pbBuff, sc->data->data() + sc->pos, tocopy);
+	sc->pos += tocopy;
+	*pcb = (LONG)tocopy;
+	return 0;
+}
+struct StreamCookieOut {
+	std::vector<unsigned char>* out;
+};
+static DWORD CALLBACK RichEdit_StreamOutCallback(DWORD_PTR dwCookie, LPBYTE pbBuff, LONG cb, LONG* pcb) {
+	StreamCookieOut* sc = (StreamCookieOut*)dwCookie;
+	if (!sc || !sc->out || pcb == nullptr) { if (pcb) *pcb = 0; return 1; }
+	sc->out->insert(sc->out->end(), pbBuff, pbBuff + cb);
+	*pcb = cb;
+	return 0;
 }
 
 // Helpers to manage Tab captions
@@ -166,12 +194,11 @@ static int CreateDoc(const std::wstring& path = L"") {
             wchar_t ext[_MAX_EXT] = {};
             _wsplitpath_s(path.c_str(), nullptr, 0, nullptr, 0, nullptr, 0, ext, _MAX_EXT);
             if (lstrcmpiW(ext, L".rtf") == 0) {
-                EDITSTREAM es{}; es.dwCookie = (DWORD_PTR)&bytes; es.pfnCallback = [](DWORD_PTR cookie, LPBYTE buf, LONG cb, LONG* pcb)->DWORD {
-                    std::vector<unsigned char>* b = (std::vector<unsigned char>*)cookie; static size_t ofs = 0; size_t tocopy = min((size_t)cb, b->size() - ofs);
-                    if (tocopy) memcpy(buf, b->data() + ofs, tocopy); *pcb = (LONG)tocopy; ofs += tocopy; if (tocopy == 0) ofs = 0; return 0;
-                    };
-                SendMessageW(hEdit, EM_STREAMIN, SF_RTF, (LPARAM)&es);
-                g_docs[idx].isRtf = true;
+                // Verwende sicheren Cookie + Callback (kein statischer Offset)
+				StreamCookieIn sc{ &bytes, 0 };
+				EDITSTREAM es{}; es.dwCookie = (DWORD_PTR)&sc; es.pfnCallback = RichEdit_StreamInCallback;
+				SendMessageW(hEdit, EM_STREAMIN, SF_RTF, (LPARAM)&es);
+				g_docs[idx].isRtf = true;
             }
             else {
                 // handle BOMs
@@ -200,175 +227,198 @@ static void EnsureMsftEditLoaded() {
 
 // Save doc to path
 static bool SaveDoc(int idx, const std::wstring& path) {
-    if (idx < 0 || idx >= (int)g_docs.size()) return false;
-    Doc& d = g_docs[idx];
-    if (d.isRtf || (!path.empty() && PathMatchSpecW(path.c_str(), L"*.rtf"))) {
-        // stream out rtf
-        std::vector<unsigned char> out;
-        EDITSTREAM es{}; es.dwCookie = (DWORD_PTR)&out; es.pfnCallback = [](DWORD_PTR cookie, LPBYTE buf, LONG cb, LONG* pcb)->DWORD {
-            std::vector<unsigned char>* v = (std::vector<unsigned char>*)cookie; v->insert(v->end(), buf, buf + cb); *pcb = cb; return 0;
-            };
-        LRESULT res = SendMessageW(d.hEdit, EM_STREAMOUT, SF_RTF, (LPARAM)&es);
-        if (!res) return false; return WriteFileAll(path, out);
-    }
-    else {
-        int len = (int)SendMessageW(d.hEdit, WM_GETTEXTLENGTH, 0, 0);
-        std::wstring w; w.resize(len); GetWindowTextW(d.hEdit, &w[0], len + 1);
-        std::string utf = WToUtf8(w);
-        // write BOM + utf-8
-        std::vector<unsigned char> out; out.push_back(0xEF); out.push_back(0xBB); out.push_back(0xBF);
-        out.insert(out.end(), utf.begin(), utf.end());
-        return WriteFileAll(path, out);
-    }
+	if (idx < 0 || idx >= (int)g_docs.size()) return false;
+	Doc& d = g_docs[idx];
+	if (d.isRtf || (!path.empty() && PathMatchSpecW(path.c_str(), L"*.rtf"))) {
+		// stream out rtf using sicheren Cookie
+		std::vector<unsigned char> out;
+		StreamCookieOut sc{ &out };
+		EDITSTREAM es{}; es.dwCookie = (DWORD_PTR)&sc; es.pfnCallback = RichEdit_StreamOutCallback;
+		LRESULT res = SendMessageW(d.hEdit, EM_STREAMOUT, SF_RTF, (LPARAM)&es);
+		if (!res) return false; return WriteFileAll(path, out);
+	}
+	else {
+		int len = (int)SendMessageW(d.hEdit, WM_GETTEXTLENGTH, 0, 0);
+		std::wstring w; w.resize(len); GetWindowTextW(d.hEdit, &w[0], len + 1);
+		std::string utf = WToUtf8(w);
+		// write BOM + utf-8
+		std::vector<unsigned char> out; out.push_back(0xEF); out.push_back(0xBB); out.push_back(0xBF);
+		out.insert(out.end(), utf.begin(), utf.end());
+		return WriteFileAll(path, out);
+	}
 }
 
 // Autosave: save each modified doc to temp as name + .autosave
 static void AutosaveAll() {
-    wchar_t tmpPath[MAX_PATH]; GetTempPathW(MAX_PATH, tmpPath);
-    for (int i = 0; i < (int)g_docs.size(); ++i) if (g_docs[i].modified) {
-        std::wstring base = g_docs[i].path.empty() ? L"untitled" : PathFindFileNameW(g_docs[i].path.c_str());
-        std::wstring safe = base; for (auto& c : safe) if (c == L'\' || c==L' / '||c==L':') c=L'_';
-            std::wstring full = std::wstring(tmpPath) + safe + L"." + std::to_wstring(i) + L".autosave";
-            // write plain text
-            int len = (int)SendMessageW(g_docs[i].hEdit, WM_GETTEXTLENGTH, 0, 0);
-            std::wstring w; w.resize(len); GetWindowTextW(g_docs[i].hEdit, &w[0], len + 1);
-            std::string utf = WToUtf8(w);
-            std::vector<unsigned char> out; out.push_back(0xEF); out.push_back(0xBB); out.push_back(0xBF);
-            out.insert(out.end(), utf.begin(), utf.end());
-            WriteFileAll(full, out);
-    }
+	wchar_t tmpPath[MAX_PATH]; GetTempPathW(MAX_PATH, tmpPath);
+	for (int i = 0; i < (int)g_docs.size(); ++i) if (g_docs[i].modified) {
+		std::wstring base = g_docs[i].path.empty() ? L"untitled" : PathFindFileNameW(g_docs[i].path.c_str());
+		std::wstring safe = base;
+		for (auto& c : safe) {
+			// Ersetze Dateisystem-unfreundliche Zeichen
+			if (c == L'\\' || c == L'/' || c == L':' || c == L'\'' || c == L'\"' || c == L' ' || c == L'\t') c = L'_';
+		}
+		std::wstring full = std::wstring(tmpPath) + safe + L"." + std::to_wstring(i) + L".autosave";
+		// write plain text
+		int len = (int)SendMessageW(g_docs[i].hEdit, WM_GETTEXTLENGTH, 0, 0);
+		std::wstring w; w.resize(len); GetWindowTextW(g_docs[i].hEdit, &w[0], len + 1);
+		std::string utf = WToUtf8(w);
+		std::vector<unsigned char> out; out.push_back(0xEF); out.push_back(0xBB); out.push_back(0xBF);
+		out.insert(out.end(), utf.begin(), utf.end());
+		WriteFileAll(full, out);
+	}
 }
 
 // Simple syntax highlighting (inefficient but illustrative)
 static std::vector<std::wstring> cppKeywords = { L"int",L"float",L"double",L"char",L"if",L"else",L"for",L"while",L"return",L"void",L"class",L"struct",L"public",L"private",L"protected",L"include",L"using",L"namespace",L"std" };
 static std::vector<std::wstring> htmlKeywords = { L"html",L"head",L"body",L"div",L"span",L"script",L"style",L"a",L"img",L"title" };
 
+// VollstÃ¤ndig Ã¼berarbeitete Highlight-Funktion (korrekte Parsing-Logik)
 static void ApplyHighlightingToDoc(int idx) {
-    if (idx < 0 || idx >= (int)g_docs.size()) return;
-    HWND h = g_docs[idx].hEdit;
-    int len = (int)SendMessageW(h, WM_GETTEXTLENGTH, 0, 0);
-    std::wstring text; text.resize(len); GetWindowTextW(h, &text[0], len + 1);
-    // reset all to default
-    CHARRANGE all{}; all.cpMin = 0; all.cpMax = -1; SendMessageW(h, EM_EXSETSEL, 0, (LPARAM)&all);
-    CHARFORMAT2 cfDefault{}; cfDefault.cbSize = sizeof(cfDefault); cfDefault.dwMask = CFM_COLOR | CFM_FACE | CFM_SIZE; cfDefault.crTextColor = RGB(0, 0, 0); wcscpy_s(cfDefault.szFaceName, L"Consolas"); cfDefault.yHeight = 200;
-    SendMessageW(h, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cfDefault);
+	if (idx < 0 || idx >= (int)g_docs.size()) return;
+	HWND h = g_docs[idx].hEdit;
+	int len = (int)SendMessageW(h, WM_GETTEXTLENGTH, 0, 0);
+	std::wstring text; text.resize(len); GetWindowTextW(h, &text[0], len + 1);
 
-    // choose simple mode based on file extension
-    bool isCpp = false, isHtml = false;
-    if (!g_docs[idx].path.empty()) {
-        wchar_t ext[_MAX_EXT] = {}; _wsplitpath_s(g_docs[idx].path.c_str(), nullptr, 0, nullptr, 0, nullptr, 0, ext, _MAX_EXT);
-        if (lstrcmpiW(ext, L".cpp") == 0 || lstrcmpiW(ext, L".h") == 0 || lstrcmpiW(ext, L".c") == 0) isCpp = true;
-        if (lstrcmpiW(ext, L".html") == 0 || lstrcmpiW(ext, L".htm") == 0) isHtml = true;
+	// Setze gesamten Text auf Default-Format
+	CHARRANGE allSel{}; allSel.cpMin = 0; allSel.cpMax = -1; SendMessageW(h, EM_EXSETSEL, 0, (LPARAM)&allSel);
+	CHARFORMAT2 cfDefault{}; cfDefault.cbSize = sizeof(cfDefault); cfDefault.dwMask = CFM_COLOR | CFM_FACE | CFM_SIZE; cfDefault.crTextColor = RGB(0, 0, 0); wcscpy_s(cfDefault.szFaceName, L"Consolas"); cfDefault.yHeight = 200;
+	SendMessageW(h, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cfDefault);
+
+	bool isCpp = false, isHtml = false;
+	if (!g_docs[idx].path.empty()) {
+		wchar_t ext[_MAX_EXT] = {}; _wsplitpath_s(g_docs[idx].path.c_str(), nullptr, 0, nullptr, 0, nullptr, 0, ext, _MAX_EXT);
+		if (lstrcmpiW(ext, L".cpp") == 0 || lstrcmpiW(ext, L".h") == 0 || lstrcmpiW(ext, L".c") == 0) isCpp = true;
+		if (lstrcmpiW(ext, L".html") == 0 || lstrcmpiW(ext, L".htm") == 0) isHtml = true;
+	}
+	if (!isCpp && !isHtml) return;
+
+	size_t pos = 0;
+	while (pos < text.size()) {
+		// C++ single-line comment //
+		if (isCpp && pos + 1 < text.size() && text[pos] == L'/' && text[pos + 1] == L'/') {
+			size_t start = pos;
+			pos += 2;
+			while (pos < text.size() && text[pos] != L'\n') ++pos;
+			CHARRANGE cr{ (LONG)start, (LONG)pos };
+			SendMessageW(h, EM_EXSETSEL, 0, (LPARAM)&cr);
+			CHARFORMAT2 cf{}; cf.cbSize = sizeof(cf); cf.dwMask = CFM_COLOR; cf.crTextColor = RGB(0, 128, 0);
+			SendMessageW(h, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+			continue;
+		}
+		// C++ multi-line comment /* ... */
+		if (isCpp && pos + 1 < text.size() && text[pos] == L'/' && text[pos + 1] == L'*') {
+			size_t start = pos;
+			pos += 2;
+			while (pos + 1 < text.size() && !(text[pos] == L'*' && text[pos + 1] == L'/')) ++pos;
+			if (pos + 1 < text.size()) pos += 2; // include closing */
+			CHARRANGE cr{ (LONG)start, (LONG)pos };
+			SendMessageW(h, EM_EXSETSEL, 0, (LPARAM)&cr);
+			CHARFORMAT2 cf{}; cf.cbSize = sizeof(cf); cf.dwMask = CFM_COLOR; cf.crTextColor = RGB(0, 128, 0);
+			SendMessageW(h, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+			continue;
+		}
+		// Strings: "..." with escaping support
+		if (text[pos] == L'\"') {
+			size_t start = pos;
+			++pos;
+			while (pos < text.size()) {
+				if (text[pos] == L'\\') { // escaped char
+					pos += 2;
+					continue;
+				}
+				if (text[pos] == L'\"') { ++pos; break; }
+				++pos;
+			}
+			CHARRANGE cr{ (LONG)start, (LONG)pos };
+			SendMessageW(h, EM_EXSETSEL, 0, (LPARAM)&cr);
+			CHARFORMAT2 cf{}; cf.cbSize = sizeof(cf); cf.dwMask = CFM_COLOR; cf.crTextColor = RGB(163, 21, 21);
+			SendMessageW(h, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+			continue;
+		}
+		// HTML tag
+		if (isHtml && text[pos] == L'<') {
+			size_t start = pos;
+			++pos;
+			while (pos < text.size() && text[pos] != L'>') ++pos;
+			if (pos < text.size()) ++pos;
+			CHARRANGE cr{ (LONG)start, (LONG)pos };
+			SendMessageW(h, EM_EXSETSEL, 0, (LPARAM)&cr);
+			CHARFORMAT2 cf{}; cf.cbSize = sizeof(cf); cf.dwMask = CFM_COLOR; cf.crTextColor = RGB(0, 0, 255);
+			SendMessageW(h, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+			continue;
+		}
+		// Keywords (C++)
+		if (isCpp && (iswalpha(text[pos]) || text[pos] == L'_')) {
+			size_t start = pos;
+			while (pos < text.size() && (iswalnum(text[pos]) || text[pos] == L'_')) ++pos;
+			std::wstring w = text.substr(start, pos - start);
+			for (auto& kw : cppKeywords) {
+				if (w == kw) {
+					CHARRANGE cr{ (LONG)start, (LONG)pos };
+					SendMessageW(h, EM_EXSETSEL, 0, (LPARAM)&cr);
+					CHARFORMAT2 cf{}; cf.cbSize = sizeof(cf); cf.dwMask = CFM_COLOR; cf.crTextColor = RGB(0, 0, 255);
+					SendMessageW(h, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+					break;
+				}
+			}
+			continue;
+		}
+		// andere Zeichen Ã¼berspringen
+		++pos;
+	}
+	// selection reset zurÃ¼cksetzen
+	CHARRANGE zeroSel{}; zeroSel.cpMin = zeroSel.cpMax = 0; SendMessageW(h, EM_EXSETSEL, 0, (LPARAM)&zeroSel);
+}
+
+// UI Setup
+static HMENU BuildMenu() {
+    HMENU m = CreateMenu();
+    HMENU f = CreatePopupMenu();
+    AppendMenuW(f, MF_STRING, ID_FILE_OPEN, L"&ï¿½ffnen...	Ctrl+O");
+    AppendMenuW(f, MF_STRING, ID_FILE_SAVE, L"&Speichern	Ctrl+S");
+    AppendMenuW(f, MF_STRING, ID_FILE_SAVEAS, L"Speichern &unter...");
+    AppendMenuW(f, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(f, MF_STRING, ID_FILE_CLOSE, L"&Schlieï¿½en");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)f, L"&Datei");
+    HMENU v = CreatePopupMenu(); AppendMenuW(v, MF_STRING, ID_VIEW_FONT, L"Schriftart..."); AppendMenuW(m, MF_POPUP, (UINT_PTR)v, L"&Ansicht");
+    return m;
+}
+
+static void DoLayout() {
+    RECT rc; GetClientRect(g_hMain, &rc);
+    int statusH = 20;
+    RECT tr; GetWindowRect(g_hStatus, &tr); statusH = tr.bottom - tr.top;
+    int sidebarW = 260;
+    MoveWindow(g_hTree, 0, 0, sidebarW, rc.bottom - statusH, TRUE);
+    MoveWindow(g_hTabs, sidebarW, 0, rc.right - sidebarW, rc.bottom - statusH, TRUE);
+    // resize current edit
+    for (auto& d : g_docs) { MoveWindow(d.hEdit, sidebarW + 4, 24, rc.right - sidebarW - 8, rc.bottom - statusH - 28, TRUE); }
+}
+
+// Tree (sidebar) shows open docs
+static void RefreshTree() {
+    TreeView_DeleteAllItems(g_hTree);
+    for (int i = 0; i < (int)g_docs.size(); ++i) {
+        TVITEM ti{}; ti.mask = TVIF_TEXT | TVIF_PARAM; ti.pszText = (LPWSTR)(g_docs[i].path.empty() ? L"Unbenannt" : PathFindFileNameW(g_docs[i].path.c_str())); ti.lParam = i;
+        TVINSERTSTRUCT ins{}; ins.item = ti; TreeView_InsertItem(g_hTree, &ins);
     }
-    if (!isCpp && !isHtml) return; // only highlight for these types
+}
 
-    // highlight strings ("...")
-    size_t pos = 0;
-    while (pos < text.size()) {
-        if (text[pos] == L'\"') {
-            size_t end = pos + 1; while (end < text.size()) {
-                if (text[end] == L'\') end+=2; else if (text[end]==L'\"') { ++end; break; } else ++end; }
-                    CHARRANGE cr{ (LONG)pos, (LONG)end };
-                    SendMessageW(h, EM_EXSETSEL, 0, (LPARAM)&cr);
-                    CHARFORMAT2 cf{}; cf.cbSize = sizeof(cf); cf.dwMask = CFM_COLOR; cf.crTextColor = RGB(163, 21, 21);
-                    SendMessageW(h, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
-                    pos = end; continue;
-            }
-            if (isCpp && pos + 1 < text.size() && text[pos] == L'/' && text[pos + 1] == L'/') {
-                size_t end = pos; while (end < text.size() && text[end] != L'
-                    ') ++end;
-                    CHARRANGE cr{ (LONG)pos, (LONG)end };
-                SendMessageW(h, EM_EXSETSEL, 0, (LPARAM)&cr);
-                CHARFORMAT2 cf{}; cf.cbSize = sizeof(cf); cf.dwMask = CFM_COLOR; cf.crTextColor = RGB(0, 128, 0);
-                SendMessageW(h, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
-                pos = end; continue;
-            }
-            if (isCpp && pos + 1 < text.size() && text[pos] == L'/' && text[pos + 1] == L'*') {
-                size_t end = pos + 2; while (end + 1 < text.size() && !(text[end] == L'*' && text[end + 1] == L'/')) ++end; if (end + 1 < text.size()) end += 2;
-                CHARRANGE cr{ (LONG)pos, (LONG)end };
-                SendMessageW(h, EM_EXSETSEL, 0, (LPARAM)&cr);
-                CHARFORMAT2 cf{}; cf.cbSize = sizeof(cf); cf.dwMask = CFM_COLOR; cf.crTextColor = RGB(0, 128, 0);
-                SendMessageW(h, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
-                pos = end; continue;
-            }
-            // words
-            if (isCpp) {
-                if (iswalpha(text[pos]) || text[pos] == L'_') {
-                    size_t start = pos; while (pos < text.size() && (iswalnum(text[pos]) || text[pos] == L'_')) ++pos; std::wstring w = text.substr(start, pos - start);
-                    for (auto& kw : cppKeywords) if (w == kw) {
-                        CHARRANGE cr{ (LONG)start, (LONG)pos };
-                        SendMessageW(h, EM_EXSETSEL, 0, (LPARAM)&cr);
-                        CHARFORMAT2 cf{}; cf.cbSize = sizeof(cf); cf.dwMask = CFM_COLOR; cf.crTextColor = RGB(0, 0, 255);
-                        SendMessageW(h, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
-                        break;
-                    }
-                    continue;
-                }
-            }
-            if (isHtml) {
-                if (text[pos] == L'<') {
-                    size_t end = pos + 1; while (end < text.size() && text[end] != L'>') ++end; if (end < text.size()) ++end;
-                    CHARRANGE cr{ (LONG)pos, (LONG)end };
-                    SendMessageW(h, EM_EXSETSEL, 0, (LPARAM)&cr);
-                    CHARFORMAT2 cf{}; cf.cbSize = sizeof(cf); cf.dwMask = CFM_COLOR; cf.crTextColor = RGB(0, 0, 255);
-                    SendMessageW(h, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
-                    pos = end; continue;
-                }
-            }
-            ++pos;
-        }
-        // reset selection
-        CHARRANGE all{}; all.cpMin = all.cpMax = 0; SendMessageW(h, EM_EXSETSEL, 0, (LPARAM)&all);
-    }
+// Status update: line/col
+static void UpdateStatus() {
+    if (g_current < 0 || g_current >= (int)g_docs.size()) return;
+    HWND h = g_docs[g_current].hEdit; int len = (int)SendMessageW(h, WM_GETTEXTLENGTH, 0, 0);
+    DWORD cp = (DWORD)SendMessageW(h, EM_GETSEL, 0, 0);
+    DWORD line = (DWORD)SendMessageW(h, EM_LINEFROMCHAR, cp, 0);
+    DWORD lineStart = (DWORD)SendMessageW(h, EM_LINEINDEX, line, 0);
+    DWORD col = cp - lineStart;
+    wchar_t buf[256]; swprintf_s(buf, L"%s ï¿½ Zeichen: %d | Zeile: %d | Spalte: %d", APP_NAME, len, line + 1, col + 1);
+    SendMessageW(g_hStatus, SB_SETTEXT, 0, (LPARAM)buf);
+}
 
-    // UI Setup
-    static HMENU BuildMenu() {
-        HMENU m = CreateMenu();
-        HMENU f = CreatePopupMenu();
-        AppendMenuW(f, MF_STRING, ID_FILE_OPEN, L"&Öffnen...	Ctrl+O");
-        AppendMenuW(f, MF_STRING, ID_FILE_SAVE, L"&Speichern	Ctrl+S");
-        AppendMenuW(f, MF_STRING, ID_FILE_SAVEAS, L"Speichern &unter...");
-        AppendMenuW(f, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(f, MF_STRING, ID_FILE_CLOSE, L"&Schließen");
-        AppendMenuW(m, MF_POPUP, (UINT_PTR)f, L"&Datei");
-        HMENU v = CreatePopupMenu(); AppendMenuW(v, MF_STRING, ID_VIEW_FONT, L"Schriftart..."); AppendMenuW(m, MF_POPUP, (UINT_PTR)v, L"&Ansicht");
-        return m;
-    }
-
-    static void DoLayout() {
-        RECT rc; GetClientRect(g_hMain, &rc);
-        int statusH = 20;
-        RECT tr; GetWindowRect(g_hStatus, &tr); statusH = tr.bottom - tr.top;
-        int sidebarW = 260;
-        MoveWindow(g_hTree, 0, 0, sidebarW, rc.bottom - statusH, TRUE);
-        MoveWindow(g_hTabs, sidebarW, 0, rc.right - sidebarW, rc.bottom - statusH, TRUE);
-        // resize current edit
-        for (auto& d : g_docs) { MoveWindow(d.hEdit, sidebarW + 4, 24, rc.right - sidebarW - 8, rc.bottom - statusH - 28, TRUE); }
-    }
-
-    // Tree (sidebar) shows open docs
-    static void RefreshTree() {
-        TreeView_DeleteAllItems(g_hTree);
-        for (int i = 0; i < (int)g_docs.size(); ++i) {
-            TVITEM ti{}; ti.mask = TVIF_TEXT | TVIF_PARAM; ti.pszText = (LPWSTR)(g_docs[i].path.empty() ? L"Unbenannt" : PathFindFileNameW(g_docs[i].path.c_str())); ti.lParam = i;
-            TVINSERTSTRUCT ins{}; ins.item = ti; TreeView_InsertItem(g_hTree, &ins);
-        }
-    }
-
-    // Status update: line/col
-    static void UpdateStatus() {
-        if (g_current < 0 || g_current >= (int)g_docs.size()) return;
-        HWND h = g_docs[g_current].hEdit; int len = (int)SendMessageW(h, WM_GETTEXTLENGTH, 0, 0);
-        DWORD cp = (DWORD)SendMessageW(h, EM_GETSEL, 0, 0);
-        DWORD line = (DWORD)SendMessageW(h, EM_LINEFROMCHAR, cp, 0);
-        DWORD lineStart = (DWORD)SendMessageW(h, EM_LINEINDEX, line, 0);
-        DWORD col = cp - lineStart;
-        wchar_t buf[256]; swprintf_s(buf, L"%s — Zeichen: %d | Zeile: %d | Spalte: %d", APP_NAME, len, line + 1, col + 1);
-        SendMessageW(g_hStatus, SB_SETTEXT, 0, (LPARAM)buf);
-    }
-
-    // Message handling
-    static LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+// Message handling
+static LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         switch (msg) {
         case WM_CREATE: {
             InitCommonControls(); EnsureMsftEditLoaded();
@@ -418,7 +468,7 @@ static void ApplyHighlightingToDoc(int idx) {
                     g_docs.erase(g_docs.begin() + g_current);
                     TabCtrl_DeleteItem(g_hTabs, g_current);
                     if (g_docs.empty()) CreateDoc();
-                    g_current = max(0, (int)g_docs.size() - 1);
+                    g_current = std::max(0, (int)g_docs.size() - 1);
                     for (int i = 0; i < (int)g_docs.size(); ++i) ShowWindow(g_docs[i].hEdit, i == g_current ? SW_SHOW : SW_HIDE);
                     UpdateAllTabs(); RefreshTree(); UpdateStatus();
                 }
