@@ -71,6 +71,13 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
     bool m_showHidden = false;
     std::vector<std::wstring> searchHistory;
 
+    // Neue UI / Funktionalitäts-Erweiterungen (zusätzlich)
+    Button m_duplicateButton{ nullptr };
+    Button m_selectAllButton{ nullptr };
+    Button m_invertSelectionButton{ nullptr };
+    ToggleButton m_toggleDetailsButton{ nullptr };
+    bool m_showDetails = false;
+
     // Neue Methoden/Prototypen
     void UpdateBreadcrumb(std::wstring const& path);
     fire_and_forget ShowPreview(FileItem const& fi);
@@ -90,14 +97,31 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
     void CopyPathToClipboard(IInspectable const&, RoutedEventArgs const&);
     void OpenInTerminal(IInspectable const&, RoutedEventArgs const&);
     void ShowProperties(IInspectable const&, RoutedEventArgs const&);
+    void DuplicateSelected(IInspectable const&, RoutedEventArgs const&);
+    void SelectAllItems(IInspectable const&, RoutedEventArgs const&);
+    void InvertSelection(IInspectable const&, RoutedEventArgs const&);
+    void ToggleDetails(IInspectable const&, RoutedEventArgs const&);
 
     void OnLaunched(LaunchActivatedEventArgs const&)
     {
         m_window = Window();
         m_window.Title(L"Ultimate Explorer Final");
 
+        // --- Theme: Dark gray palette ---
+        auto darkBackgroundBrush = SolidColorBrush(Windows::UI::ColorHelper::FromArgb(255, 30, 30, 30));   // main background
+        auto panelBrush = SolidColorBrush(Windows::UI::ColorHelper::FromArgb(255, 40, 40, 40));             // panels
+        auto cardBrush = SolidColorBrush(Windows::UI::ColorHelper::FromArgb(255, 48, 48, 48));              // item cards
+        auto accentBrush = SolidColorBrush(Windows::UI::ColorHelper::FromArgb(255, 70, 70, 70));            // buttons / accents
+        auto textBrush = SolidColorBrush(Windows::UI::ColorHelper::FromArgb(255, 230, 230, 230));           // primary text
+        auto subTextBrush = SolidColorBrush(Windows::UI::ColorHelper::FromArgb(255, 190, 190, 190));        // secondary text
+        auto previewBrush = SolidColorBrush(Windows::UI::ColorHelper::FromArgb(255, 36, 36, 36));           // preview background
+
         m_navView = NavigationView();
+        // Apply dark background to nav view
+        m_navView.Background(darkBackgroundBrush);
+
         Grid mainGrid;
+        mainGrid.Background(panelBrush); // darker panel background
         mainGrid.RowDefinitions().Append(RowDefinition{ GridLengthHelper::Auto() }); // Adressleiste
         mainGrid.RowDefinitions().Append(RowDefinition{ GridLengthHelper::Auto() }); // Suchleiste
         mainGrid.RowDefinitions().Append(RowDefinition{ GridLengthHelper::Auto() }); // Sortierleiste
@@ -120,29 +144,48 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
         StackPanel sortPanel;
         sortPanel.Orientation(Orientation::Horizontal);
         sortPanel.Spacing(5);
+        sortPanel.Background(winrt::box_value(nullptr)); // keep transparent, uses mainGrid bg
+
         Button sortName; sortName.Content(box_value(winrt::hstring(L"Name"))); sortName.Click({ this, &ExplorerFinal::SortByName });
         Button sortSize; sortSize.Content(box_value(winrt::hstring(L"Größe"))); sortSize.Click({ this, &ExplorerFinal::SortBySize });
         Button sortDate; sortDate.Content(box_value(winrt::hstring(L"Datum"))); sortDate.Click({ this, &ExplorerFinal::SortByDate });
         Button sortType; sortType.Content(box_value(winrt::hstring(L"Typ"))); sortType.Click({ this, &ExplorerFinal::SortByType });
+
+        // Style buttons: dark accent + light text
+        auto styleBtn = [&](Button& b) {
+            b.Background(accentBrush);
+            b.Foreground(textBrush);
+            b.BorderBrush(nullptr);
+            b.CornerRadius(Microsoft::UI::Xaml::CornerRadius{ 6 });
+            b.Padding(ThicknessHelper::FromLengths(8, 6, 8, 6));
+        };
+        styleBtn(sortName); styleBtn(sortSize); styleBtn(sortDate); styleBtn(sortType);
+
         sortPanel.Children().Append(sortName);
         sortPanel.Children().Append(sortSize);
-        sortPanel.Children().Append(sortType); // <-- neu
+        sortPanel.Children().Append(sortType);
         sortPanel.Children().Append(sortDate);
 
         // Füge rekursiven Suche-Toggle + Analyse + Batch-Rename Buttons in SortPanel
         m_recursiveToggle = ToggleSwitch();
         m_recursiveToggle.IsOn(false);
         m_recursiveToggle.OnContent(winrt::box_value(winrt::hstring(L"Rekursiv")));
+        m_recursiveToggle.OffContent(winrt::box_value(winrt::hstring(L"Rekursiv")));
+        // Toggle background/foreground
+        m_recursiveToggle.Background(panelBrush);
+        m_recursiveToggle.Foreground(textBrush);
         sortPanel.Children().Append(m_recursiveToggle);
 
         m_analyzeButton = Button();
         m_analyzeButton.Content(winrt::box_value(winrt::hstring(L"Analyze Sizes")));
         m_analyzeButton.Click({ this, &ExplorerFinal::AnalyzeSizes });
+        styleBtn(m_analyzeButton);
         sortPanel.Children().Append(m_analyzeButton);
 
         m_batchRenameButton = Button();
         m_batchRenameButton.Content(winrt::box_value(winrt::hstring(L"Batch-Rename")));
         m_batchRenameButton.Click({ this, &ExplorerFinal::BatchRename });
+        styleBtn(m_batchRenameButton);
         sortPanel.Children().Append(m_batchRenameButton);
 
         // Neue Buttons: Compress / Extract / Properties / CopyPath / OpenTerminal / ToggleHidden
@@ -152,6 +195,12 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
         m_copyPathButton = Button(); m_copyPathButton.Content(winrt::box_value(winrt::hstring(L"Copy Path"))); m_copyPathButton.Click({ this, &ExplorerFinal::CopyPathToClipboard });
         m_openTerminalButton = Button(); m_openTerminalButton.Content(winrt::box_value(winrt::hstring(L"Open Terminal"))); m_openTerminalButton.Click({ this, &ExplorerFinal::OpenInTerminal });
         m_toggleHiddenButton = ToggleButton(); m_toggleHiddenButton.Content(winrt::box_value(winrt::hstring(L"Show Hidden"))); m_toggleHiddenButton.Checked({ this, &ExplorerFinal::ToggleShowHidden }); m_toggleHiddenButton.Unchecked({ this, &ExplorerFinal::ToggleShowHidden });
+
+        // Style the new buttons consistently
+        styleBtn(m_compressButton); styleBtn(m_extractButton); styleBtn(m_propertiesButton);
+        styleBtn(m_copyPathButton); styleBtn(m_openTerminalButton);
+        // ToggleButton styling (use same visuals as Button)
+        m_toggleHiddenButton.Background(accentBrush); m_toggleHiddenButton.Foreground(textBrush); m_toggleHiddenButton.CornerRadius(Microsoft::UI::Xaml::CornerRadius{6});
 
         sortPanel.Children().Append(m_compressButton);
         sortPanel.Children().Append(m_extractButton);
@@ -172,6 +221,10 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
         m_searchButton = Button();
         m_searchButton.Content(winrt::box_value(winrt::hstring(L"Search")));
         m_searchButton.Click([this](auto const&, auto const&) { PerformSearch(); });
+        styleBtn(m_searchButton);
+        // ComboBox style
+        m_searchHistoryCombo.Background(panelBrush);
+        m_searchHistoryCombo.Foreground(textBrush);
 
         searchStack.Children().Append(m_searchBox);
         searchStack.Children().Append(m_searchButton);
@@ -180,14 +233,22 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
         // replace previous single-searchBox append with the stack
         mainGrid.Children().Append(searchStack);
 
-        // Datei-GridView
+        // Datei-GridView & content: ensure background and previews use dark scheme
         m_fileGrid = GridView();
         Grid::SetRow(m_fileGrid, 3);
         m_fileGrid.IsItemClickEnabled(true);
+        m_fileGrid.Background(panelBrush);        // grid background
         m_fileGrid.ItemClick({ this, &ExplorerFinal::FileItemClick });
         m_fileGrid.AllowDrop(true);
         m_fileGrid.DragItemsStarting({ this, &ExplorerFinal::DragStart });
         m_fileGrid.Drop({ this, &ExplorerFinal::DropFiles });
+
+        // Preview border styling
+        if (m_previewBorder) {
+            m_previewBorder.Background(previewBrush);
+            m_previewBorder.BorderBrush(accentBrush);
+        }
+
         mainGrid.Children().Append(m_fileGrid);
 
         // Kontextmenü: now use member items so Opening-handler can update them
@@ -298,19 +359,59 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
                 fi.size = ((ULONGLONG)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
                 fi.modifiedTime = fd.ftLastWriteTime;
 
-                if (!fi.isFolder) {
-                    IShellItem* psi = nullptr;
-                    SHCreateItemFromParsingName(fi.fullPath.c_str(), nullptr, IID_PPV_ARGS(&psi));
-                    if (psi) {
-                        winrt::com_ptr<IShellItemImageFactory> factory;
-                        psi->QueryInterface(IID_PPV_ARGS(&factory));
-                        fi.imageFactory = factory;
-                        psi->Release();
-                    }
+                currentItems.push_back(fi);
+
+                // Build a nicer rounded card for the GridView item (dark theme)
+                Border itemCard;
+                itemCard.CornerRadius(Microsoft::UI::Xaml::CornerRadius{ 8 });
+                itemCard.Padding(ThicknessHelper::FromUniformLength(8));
+                itemCard.Margin(ThicknessHelper::FromLengths(6, 6, 6, 6));
+                // dark card
+                itemCard.Background(SolidColorBrush(Windows::UI::ColorHelper::FromArgb(255, 48, 48, 48)));
+
+                StackPanel cardStack;
+                cardStack.Orientation(Orientation::Vertical);
+
+                TextBlock iconTb;
+                iconTb.FontSize(28);
+                iconTb.Margin(ThicknessHelper::FromLengths(0, 0, 0, 4));
+                iconTb.Text(winrt::hstring(fi.isFolder ? L"📁" : L"📄"));
+                iconTb.Foreground(SolidColorBrush(Windows::UI::ColorHelper::FromArgb(255, 230, 230, 230)));
+
+                TextBlock nameTb;
+                nameTb.Text(winrt::hstring(fi.name));
+                nameTb.TextWrapping(TextWrapping::NoWrap);
+                nameTb.MaxWidth(220);
+                nameTb.FontSize(14);
+                nameTb.FontWeight(Windows::UI::Text::FontWeights::SemiBold());
+                nameTb.Foreground(SolidColorBrush(Windows::UI::ColorHelper::FromArgb(255, 235, 235, 235)));
+
+                cardStack.Children().Append(iconTb);
+                cardStack.Children().Append(nameTb);
+
+                if (m_showDetails) {
+                    std::wstringstream ss;
+                    ss << L"Size: " << fi.size << L" bytes\n";
+                    SYSTEMTIME stUTC, stLocal;
+                    FileTimeToSystemTime(&fi.modifiedTime, &stUTC);
+                    SystemTimeToTzSpecificLocalTime(NULL, &stUTC, &stLocal);
+                    ss << L"Modified: " << stLocal.wDay << L"." << stLocal.wMonth << L"." << stLocal.wYear;
+                    TextBlock detailsTb;
+                    detailsTb.Text(winrt::hstring(ss.str()));
+                    detailsTb.FontSize(11);
+                    detailsTb.Opacity(0.9);
+                    detailsTb.TextWrapping(TextWrapping::Wrap);
+                    detailsTb.Margin(ThicknessHelper::FromLengths(0,4,0,0));
+                    detailsTb.Foreground(SolidColorBrush(Windows::UI::ColorHelper::FromArgb(255, 190, 190, 190)));
+                    cardStack.Children().Append(detailsTb);
                 }
 
-                currentItems.push_back(fi);
-                m_fileGrid.Items().Append(box_value(winrt::hstring(fi.name))); // <-- store hstring-backed items
+                itemCard.Child(cardStack);
+
+                // attach the full path in Tag for later retrieval on clicks
+                itemCard.Tag(winrt::box_value(winrt::hstring(fi.fullPath)));
+
+                m_fileGrid.Items().Append(itemCard);
             }
         } while (FindNextFile(hFind, &fd));
         FindClose(hFind);
@@ -335,23 +436,40 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
             PopulateFiles(m_addressBar.Text());
     }
 
+    // Adjusted FileItemClick: retrieve path from Tag if item is a UI element
     void FileItemClick(IInspectable const&, ItemClickEventArgs const& args) {
-        hstring clicked = unbox_value<hstring>(args.ClickedItem());
+        auto clickedObj = args.ClickedItem();
+        auto fe = clickedObj.try_as<FrameworkElement>();
+        std::wstring clickedPath;
+        if (fe) {
+            try {
+                clickedPath = unbox_value<hstring>(fe.Tag()).c_str();
+            } catch (...) { /* fallback */ }
+        } else {
+            // legacy: clicked item may be a string
+            try {
+                clickedPath = unbox_value<hstring>(clickedObj).c_str();
+            } catch (...) {}
+        }
+
+        if (clickedPath.empty()) return;
+
         auto it = std::find_if(filteredItems.begin(), filteredItems.end(),
-            [&clicked](FileItem& fi) { return fi.name == clicked.c_str(); });
+            [&clickedPath](FileItem& fi) { return fi.fullPath == clickedPath; });
+
         if (it != filteredItems.end()) {
             if (it->isFolder) {
                 m_addressBar.Text(it->fullPath);
                 PopulateFiles(it->fullPath);
                 UpdateBreadcrumb(it->fullPath);
-            }
-            else {
+            } else {
                 ShellExecute(nullptr, L"open", it->fullPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
                 AddToRecent(it->fullPath);
             }
         }
     }
 
+    // Adjusted SelectionChanged preview: use Tag to find FileItem
     void FileSelectionChanged(IInspectable const&, SelectionChangedEventArgs const&) {
         auto sel = m_fileGrid.SelectedItem();
         if (!sel) {
@@ -359,9 +477,14 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
             m_previewText.Text(L"");
             return;
         }
-        hstring name = unbox_value<hstring>(sel);
+        auto fe = sel.try_as<FrameworkElement>();
+        std::wstring path;
+        if (fe) {
+            try { path = unbox_value<hstring>(fe.Tag()).c_str(); } catch (...) {}
+        }
+        if (path.empty()) return;
         auto it = std::find_if(currentItems.begin(), currentItems.end(),
-            [&name](FileItem const& fi) { return fi.name == name.c_str(); });
+            [&path](FileItem const& fi) { return fi.fullPath == path; });
         if (it != currentItems.end()) {
             // Show preview asynchronously
             ShowPreview(*it);
