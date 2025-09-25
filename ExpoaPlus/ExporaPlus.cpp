@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <fstream>
 #include <json/json.h>
+#include <winrt/Windows.System.h> // <-- neu: VirtualKey / hresult handling support
 
 using namespace winrt;
 using namespace Microsoft::UI::Xaml;
@@ -44,6 +45,10 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
     int sortColumn = 0; // 0=Name,1=Type,2=Size,3=Date
     std::vector<std::wstring> favorites;
 
+    // Neue Member für Kontextmenü (damit lambdas / Opening handler sicher darauf zugreifen)
+    MenuFlyoutItem m_addFavItem{ nullptr };
+    MenuFlyoutItem m_remFavItem{ nullptr };
+
     void CopyItem(IInspectable const&, RoutedEventArgs const&);
     void DeleteItem(IInspectable const&, RoutedEventArgs const&);
     void RenameItem(IInspectable const&, RoutedEventArgs const&);
@@ -51,7 +56,10 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
     void SortByName(IInspectable const&, RoutedEventArgs const&);
     void SortBySize(IInspectable const&, RoutedEventArgs const&);
     void SortByDate(IInspectable const&, RoutedEventArgs const&);
+    void SortByType(IInspectable const&, RoutedEventArgs const&);
     void SortAndRefresh();
+    void AddToFavorites(IInspectable const&, RoutedEventArgs const&);
+    void RemoveFromFavorites(IInspectable const&, RoutedEventArgs const&);
 
     void OnLaunched(LaunchActivatedEventArgs const&)
     {
@@ -78,15 +86,17 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
         Grid::SetRow(m_searchBox, 1);
         mainGrid.Children().Append(m_searchBox);
 
-        // Sortierleiste
+        // Sortierleiste: zusätzlicher "Typ"-Button
         StackPanel sortPanel;
         sortPanel.Orientation(Orientation::Horizontal);
         sortPanel.Spacing(5);
-        Button sortName; sortName.Content(box_value(L"Name")); sortName.Click({ this, &ExplorerFinal::SortByName });
-        Button sortSize; sortSize.Content(box_value(L"Größe")); sortSize.Click({ this, &ExplorerFinal::SortBySize });
-        Button sortDate; sortDate.Content(box_value(L"Datum")); sortDate.Click({ this, &ExplorerFinal::SortByDate });
+        Button sortName; sortName.Content(box_value(winrt::hstring(L"Name"))); sortName.Click({ this, &ExplorerFinal::SortByName });
+        Button sortSize; sortSize.Content(box_value(winrt::hstring(L"Größe"))); sortSize.Click({ this, &ExplorerFinal::SortBySize });
+        Button sortDate; sortDate.Content(box_value(winrt::hstring(L"Datum"))); sortDate.Click({ this, &ExplorerFinal::SortByDate });
+        Button sortType; sortType.Content(box_value(winrt::hstring(L"Typ"))); sortType.Click({ this, &ExplorerFinal::SortByType });
         sortPanel.Children().Append(sortName);
         sortPanel.Children().Append(sortSize);
+        sortPanel.Children().Append(sortType); // <-- neu
         sortPanel.Children().Append(sortDate);
         Grid::SetRow(sortPanel, 2);
         mainGrid.Children().Append(sortPanel);
@@ -101,14 +111,46 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
         m_fileGrid.Drop({ this, &ExplorerFinal::DropFiles });
         mainGrid.Children().Append(m_fileGrid);
 
-        // Kontextmenü
+        // Kontextmenü: now use member items so Opening-handler can update them
         MenuFlyout flyout;
         MenuFlyoutItem copyItem; copyItem.Text(L"Kopieren"); copyItem.Click({ this, &ExplorerFinal::CopyItem });
         MenuFlyoutItem pasteItem; pasteItem.Text(L"Einfügen"); pasteItem.Click({ this, &ExplorerFinal::PasteItem });
         MenuFlyoutItem deleteItem; deleteItem.Text(L"Löschen"); deleteItem.Click({ this, &ExplorerFinal::DeleteItem });
         MenuFlyoutItem renameItem; renameItem.Text(L"Umbenennen"); renameItem.Click({ this, &ExplorerFinal::RenameItem });
-        flyout.Items().Append(copyItem); flyout.Items().Append(pasteItem); flyout.Items().Append(deleteItem); flyout.Items().Append(renameItem);
+
+        m_addFavItem = MenuFlyoutItem(); m_addFavItem.Text(L"Zu Favoriten hinzufügen"); m_addFavItem.Click({ this, &ExplorerFinal::AddToFavorites });
+        m_remFavItem = MenuFlyoutItem(); m_remFavItem.Text(L"Aus Favoriten entfernen"); m_remFavItem.Click({ this, &ExplorerFinal::RemoveFromFavorites });
+
+        flyout.Items().Append(copyItem);
+        flyout.Items().Append(pasteItem);
+        flyout.Items().Append(deleteItem);
+        flyout.Items().Append(renameItem);
+        flyout.Items().Append(m_addFavItem);
+        flyout.Items().Append(m_remFavItem);
+
+        // Opening-Handler: aktivieren/deaktivieren je nach Auswahl / Favoriten-Status
+        flyout.Opening([this](auto const&, auto const&) {
+            auto sel = m_fileGrid.SelectedItem();
+            bool enableAdd = false;
+            bool enableRem = false;
+            if (sel) {
+                hstring name = unbox_value<hstring>(sel);
+                auto it = FindItemByName(name);
+                if (it != currentItems.end()) {
+                    std::wstring path = it->fullPath;
+                    bool isFav = (std::find(favorites.begin(), favorites.end(), path) != favorites.end());
+                    enableAdd = !isFav;
+                    enableRem = isFav;
+                }
+            }
+            m_addFavItem.IsEnabled(enableAdd);
+            m_remFavItem.IsEnabled(enableRem);
+        });
+
         m_fileGrid.ContextFlyout(flyout);
+
+        // F5 Refresh: Window KeyDown handler registrieren
+        m_window.KeyDown({ this, &ExplorerFinal::WindowKeyDown });
 
         m_navView.Content(mainGrid);
         LoadFavorites();
@@ -121,13 +163,14 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
 
     // Sidebar: Laufwerke + Favoriten
     void PopulateSidebar() {
+        m_navView.MenuItems().Clear(); // Verhindert doppelte Einträge
         DWORD drives = GetLogicalDrives();
         for (int i = 0; i < 26; i++) {
             if (drives & (1 << i)) {
                 std::wstring drive = { wchar_t(L'A' + i), L':' };
                 NavigationViewItem item;
-                item.Content(winrt::box_value(drive));
-                item.Tag(winrt::box_value(drive));
+                item.Content(winrt::box_value(winrt::hstring(drive))); // <-- sicherer box_value(hstring)
+                item.Tag(winrt::box_value(winrt::hstring(drive)));
                 item.Tapped([this, drive](auto&&, auto&&) {
                     m_addressBar.Text(drive + L"\\");
                     PopulateFiles(m_addressBar.Text());
@@ -139,8 +182,8 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
         // Favoriten hinzufügen
         for (auto& fav : favorites) {
             NavigationViewItem favItem;
-            favItem.Content(winrt::box_value(fav));
-            favItem.Tag(winrt::box_value(fav));
+            favItem.Content(winrt::box_value(winrt::hstring(fav))); // <-- sicherer box_value(hstring)
+            favItem.Tag(winrt::box_value(winrt::hstring(fav)));
             favItem.Tapped([this, fav](auto&&, auto&&) {
                 m_addressBar.Text(fav);
                 PopulateFiles(m_addressBar.Text());
@@ -153,15 +196,17 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
     void PopulateFiles(hstring path) {
         currentItems.clear();
         m_fileGrid.Items().Clear();
+        std::wstring dir = path.c_str();
+        if (!std::filesystem::exists(dir) || !std::filesystem::is_directory(dir)) return;
         WIN32_FIND_DATA fd;
-        HANDLE hFind = FindFirstFile((std::wstring(path) + L"\\*").c_str(), &fd);
+        HANDLE hFind = FindFirstFile((dir + L"\\*").c_str(), &fd);
         if (hFind == INVALID_HANDLE_VALUE) return;
 
         do {
             if (wcscmp(fd.cFileName, L".") != 0 && wcscmp(fd.cFileName, L"..") != 0) {
                 FileItem fi;
                 fi.name = fd.cFileName;
-                fi.fullPath = std::wstring(path) + L"\\" + fd.cFileName;
+                fi.fullPath = dir + L"\\" + fd.cFileName;
                 fi.isFolder = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
                 fi.size = ((ULONGLONG)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
                 fi.modifiedTime = fd.ftLastWriteTime;
@@ -178,7 +223,7 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
                 }
 
                 currentItems.push_back(fi);
-                m_fileGrid.Items().Append(box_value(fi.name));
+                m_fileGrid.Items().Append(box_value(winrt::hstring(fi.name))); // <-- store hstring-backed items
             }
         } while (FindNextFile(hFind, &fd));
         FindClose(hFind);
@@ -245,23 +290,38 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
     }
 
     fire_and_forget DropFiles(IInspectable const&, DragEventArgs const& args) {
-        if (args.DataView().Contains(StandardDataFormats::StorageItems())) {
-            auto items = co_await args.DataView().GetStorageItemsAsync();
-            auto destPath = m_addressBar.Text();
+        try {
+            if (args.DataView().Contains(StandardDataFormats::StorageItems())) {
+                auto items = co_await args.DataView().GetStorageItemsAsync();
+                auto destPath = m_addressBar.Text();
 
-            for (auto const& item : items) {
-                if (item.IsOfType(StorageItemTypes::File)) {
-                    auto file = item.as<StorageFile>();
-                    auto destFolder = co_await StorageFolder::GetFolderFromPathAsync(destPath);
-                    co_await file.MoveAsync(destFolder);
+                for (auto const& item : items) {
+                    try {
+                        if (item.IsOfType(StorageItemTypes::File)) {
+                            auto file = item.as<StorageFile>();
+                            auto destFolder = co_await StorageFolder::GetFolderFromPathAsync(destPath);
+                            co_await file.MoveAsync(destFolder);
+                        } else if (item.IsOfType(StorageItemTypes::Folder)) {
+                            auto folder = item.as<StorageFolder>();
+                            auto destFolder = co_await StorageFolder::GetFolderFromPathAsync(destPath);
+                            co_await folder.MoveAsync(destFolder);
+                        }
+                    } catch (const winrt::hresult_error& e) {
+                        // Log or handle the error for individual items
+                        std::wstring msg = L"Error moving item: ";
+                        msg += e.message().c_str();
+                        msg += L"\n";
+                        OutputDebugStringW(msg.c_str());
+                    }
                 }
-                else if (item.IsOfType(StorageItemTypes::Folder)) {
-                    auto folder = item.as<StorageFolder>();
-                    auto destFolder = co_await StorageFolder::GetFolderFromPathAsync(destPath);
-                    co_await folder.MoveAsync(destFolder);
-                }
+                PopulateFiles(destPath);
             }
-            PopulateFiles(destPath);
+        } catch (const winrt::hresult_error& e) {
+            // Log or handle the error for the entire operation
+            std::wstring msg = L"Error during drag-and-drop: ";
+            msg += e.message().c_str();
+            msg += L"\n";
+            OutputDebugStringW(msg.c_str());
         }
     }
 
@@ -285,6 +345,14 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
         SortAndRefresh();
     }
 
+    // Sortierung nach Typ (Extension)
+    void SortByType(IInspectable const&, RoutedEventArgs const&) {
+        if (sortColumn == 1) sortAscending = !sortAscending;
+        else sortAscending = true;
+        sortColumn = 1;
+        SortAndRefresh();
+    }
+
     void SortAndRefresh() {
         std::sort(filteredItems.begin(), filteredItems.end(), [this](const FileItem& a, const FileItem& b) {
             int comparison = 0;
@@ -292,6 +360,14 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
             case 0: // Name
                 comparison = _wcsicmp(a.name.c_str(), b.name.c_str());
                 break;
+            case 1: { // Type (extension)
+                auto extA = std::filesystem::path(a.name).extension().wstring();
+                auto extB = std::filesystem::path(b.name).extension().wstring();
+                // case-insensitive
+                comparison = _wcsicmp(extA.c_str(), extB.c_str());
+                if (comparison == 0) comparison = _wcsicmp(a.name.c_str(), b.name.c_str());
+                break;
+            }
             case 2: // Size
                 if (a.size < b.size) comparison = -1;
                 else if (a.size > b.size) comparison = 1;
@@ -302,11 +378,11 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
                 break;
             }
             return sortAscending ? (comparison < 0) : (comparison > 0);
-            });
+        });
 
         m_fileGrid.Items().Clear();
         for (auto const& fi : filteredItems) {
-            m_fileGrid.Items().Append(box_value(fi.name));
+            m_fileGrid.Items().Append(box_value(winrt::hstring(fi.name)));
         }
     }
 
@@ -320,7 +396,7 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
 
         if (it != currentItems.end()) {
             std::wstring path = it->fullPath;
-            size_t len = sizeof(DROPFILES) + (path.length() + 2) * sizeof(wchar_t);
+            size_t len = sizeof(DROPFILES) + (path.length() + 2) * sizeof(wchar_t); // +2 for double null terminator
             HGLOBAL hg = GlobalAlloc(GHND, len);
             if (!hg) return;
 
@@ -333,6 +409,7 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
             df->fWide = TRUE;
             wchar_t* dst = (wchar_t*)(df + 1);
             wcscpy_s(dst, path.length() + 1, path.c_str());
+            dst[path.length() + 1] = L'\0'; // Double null terminate
             GlobalUnlock(hg);
 
             if (OpenClipboard(nullptr)) {
@@ -343,6 +420,7 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
             else {
                 GlobalFree(hg);
             }
+            m_fileGrid.SelectedItem(nullptr); // Auswahl zurücksetzen
         }
     }
 
@@ -354,23 +432,28 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
                 if (hDrop) {
                     UINT fileCount = DragQueryFileW(hDrop, 0xFFFFFFFF, nullptr, 0);
                     if (fileCount > 0) {
-                        std::wstring fromPath;
+                        UINT totalLen = 0;
                         for (UINT i = 0; i < fileCount; ++i) {
-                            UINT len = DragQueryFileW(hDrop, i, nullptr, 0) + 1;
-                            std::vector<wchar_t> buffer(len);
-                            DragQueryFileW(hDrop, i, buffer.data(), len);
-                            fromPath += buffer.data();
-                            fromPath += L'\0';
+                            totalLen += DragQueryFileW(hDrop, i, nullptr, 0);
                         }
-                        fromPath += L'\0';
+                        totalLen += fileCount + 1;
 
-                        std::wstring toPath = m_addressBar.Text().c_str();
-                        toPath += L'\0';
+                        std::vector<wchar_t> fromPath(totalLen);
+                        wchar_t* current = fromPath.data();
+                        for (UINT i = 0; i < fileCount; ++i) {
+                            UINT len = DragQueryFileW(hDrop, i, current, totalLen - (current - fromPath.data()));
+                            current += len + 1;
+                        }
+                        *current = L'\0';
+
+                        std::wstring toPathStr = m_addressBar.Text().c_str();
+                        std::vector<wchar_t> toPath(toPathStr.length() + 2, 0);
+                        wcscpy_s(toPath.data(), toPathStr.length() + 1, toPathStr.c_str());
 
                         SHFILEOPSTRUCTW fileOp = { 0 };
                         fileOp.wFunc = FO_COPY;
-                        fileOp.pFrom = fromPath.c_str();
-                        fileOp.pTo = toPath.c_str();
+                        fileOp.pFrom = fromPath.data();
+                        fileOp.pTo = toPath.data();
                         fileOp.fFlags = FOF_ALLOWUNDO;
 
                         if (SHFileOperationW(&fileOp) == 0 && !fileOp.fAnyOperationsAborted) {
@@ -382,6 +465,7 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
             }
             CloseClipboard();
         }
+        m_fileGrid.SelectedItem(nullptr); // Auswahl zurücksetzen
     }
 
     void DeleteItem(IInspectable const&, RoutedEventArgs const&) {
@@ -394,19 +478,22 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
 
         if (it != currentItems.end()) {
             std::wstring path = it->fullPath;
-            path.push_back(L'\0'); // Double-null terminate for SHFileOperation
+            std::vector<wchar_t> doubleNullPath(path.length() + 2, 0);
+            wcscpy_s(doubleNullPath.data(), path.length() + 1, path.c_str());
 
             SHFILEOPSTRUCTW fileOp = { 0 };
             fileOp.wFunc = FO_DELETE;
-            fileOp.pFrom = path.c_str();
-            fileOp.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION; // Use FOF_ALLOWUNDO for recycle bin
+            fileOp.pFrom = doubleNullPath.data();
+            fileOp.fFlags = FOF_ALLOWUNDO;
 
             int result = SHFileOperationW(&fileOp);
             if (result == 0 && !fileOp.fAnyOperationsAborted) {
                 PopulateFiles(m_addressBar.Text());
             }
+            m_fileGrid.SelectedItem(nullptr); // Auswahl zurücksetzen
         }
     }
+
     fire_and_forget RenameItem(IInspectable const&, RoutedEventArgs const&) {
         auto selectedItem = m_fileGrid.SelectedItem();
         if (!selectedItem) co_return;
@@ -427,9 +514,9 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
             dialog.XamlRoot(m_fileGrid.XamlRoot());
 
             auto result = co_await dialog.ShowAsync();
-            if (result == ContentDialogResult::Primary) {
+            std::wstring newName = input.Text().c_str();
+            if (result == ContentDialogResult::Primary && !newName.empty() && newName != it->name) {
                 std::wstring oldPath = it->fullPath;
-                std::wstring newName = input.Text().c_str();
                 std::filesystem::path p(oldPath);
                 std::wstring newPath = p.parent_path().wstring() + L"\\" + newName;
 
@@ -437,34 +524,162 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
                     PopulateFiles(m_addressBar.Text());
                 }
             }
+            m_fileGrid.SelectedItem(nullptr); // Auswahl zurücksetzen
+        }
+    }
+
+    std::wstring GetFavoritesPath() {
+        PWSTR path = NULL;
+        HRESULT hr = SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, NULL, &path);
+        if (SUCCEEDED(hr)) {
+            std::wstring appDataPath(path);
+            CoTaskMemFree(path);
+            std::filesystem::path p = appDataPath;
+            p /= L"UltimateExplorer";
+            std::filesystem::create_directories(p);
+            p /= L"favorites.json";
+            return p.wstring();
+        }
+        return L"favorites.json"; // Fallback
+    }
+
+    // Hilfsfunktionen: Suche selektiertes Element
+    std::vector<FileItem>::iterator FindItemByName(hstring const& name) {
+        std::wstring n = name.c_str();
+        return std::find_if(currentItems.begin(), currentItems.end(),
+            [&n](FileItem const& fi) { return fi.name == n; });
+    }
+
+    // Window KeyDown: F5 refresh
+    void WindowKeyDown(IInspectable const&, KeyRoutedEventArgs const& args) {
+        if (args.Key() == Windows::System::VirtualKey::F5) {
+            PopulateFiles(m_addressBar.Text());
         }
     }
 
     void LoadFavorites() {
-        std::ifstream f("favorites.json");
+        favorites.clear();
+        std::ifstream f(GetFavoritesPath(), std::ios::binary);
         if (f.is_open()) {
-            Json::Value root;
-            f >> root;
-            for (auto& val : root["favorites"]) {
-                std::string s = val.asString();
-                favorites.push_back(std::wstring(s.begin(), s.end()));
+            try {
+                std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+                Json::CharReaderBuilder rbuilder;
+                std::unique_ptr<Json::CharReader> reader(rbuilder.newCharReader());
+                Json::Value root;
+                std::string errs;
+                if (reader->parse(content.c_str(), content.c_str() + content.size(), &root, &errs)) {
+                    if (root.isMember("favorites") && root["favorites"].isArray()) {
+                        for (auto& val : root["favorites"]) {
+                            std::string s = val.asString();
+                            favorites.push_back(WStringFromUtf8(s));
+                        }
+                    }
+                }
+            } catch (const std::exception& e) {
+                OutputDebugStringA(("Error loading favorites: " + std::string(e.what()) + "\n").c_str());
             }
+        } else {
+            SaveFavorites();
         }
+        // dedupe just in case
+        std::sort(favorites.begin(), favorites.end());
+        favorites.erase(std::unique(favorites.begin(), favorites.end()), favorites.end());
     }
 
     void SaveFavorites() {
-        Json::Value root;
-        for (auto& fav : favorites) {
-            std::string s(fav.begin(), fav.end());
-            root["favorites"].append(s);
+        try {
+            Json::Value root;
+            for (auto& fav : favorites) {
+                root["favorites"].append(Utf8FromWString(fav));
+            }
+            Json::StreamWriterBuilder wbuilder;
+            wbuilder["indentation"] = "  ";
+            const std::string output = Json::writeString(wbuilder, root);
+            std::ofstream f(GetFavoritesPath(), std::ios::binary);
+            if (f.is_open()) {
+                f << output;
+            } else {
+                OutputDebugStringA("Error: Unable to open favorites.json for writing.\n");
+            }
+        } catch (const std::exception& e) {
+            OutputDebugStringA(("Error saving favorites: " + std::string(e.what()) + "\n").c_str());
         }
-        std::ofstream f("favorites.json");
-        f << root;
+    }
+
+    // Neue Methoden: Favoriten hinzufügen / entfernen
+    void AddToFavorites(IInspectable const&, RoutedEventArgs const&) {
+        auto selectedItem = m_fileGrid.SelectedItem();
+        if (!selectedItem) return;
+
+        hstring name = unbox_value<hstring>(selectedItem);
+        auto it = std::find_if(currentItems.begin(), currentItems.end(),
+            [&name](FileItem const& fi) { return fi.name == name.c_str(); });
+
+        if (it != currentItems.end()) {
+            std::wstring pathToAdd;
+            if (it->isFolder) {
+                pathToAdd = it->fullPath;
+            } else {
+                // für Dateien: Ordner als Favorit speichern
+                std::filesystem::path p(it->fullPath);
+                pathToAdd = p.parent_path().wstring();
+            }
+
+            if (!pathToAdd.empty() &&
+                std::find(favorites.begin(), favorites.end(), pathToAdd) == favorites.end()) {
+                favorites.push_back(pathToAdd);
+                SaveFavorites();
+                PopulateSidebar();
+            }
+        }
+        m_fileGrid.SelectedItem(nullptr);
+    }
+
+    void RemoveFromFavorites(IInspectable const&, RoutedEventArgs const&) {
+        auto selectedItem = m_fileGrid.SelectedItem();
+        if (!selectedItem) return;
+
+        hstring name = unbox_value<hstring>(selectedItem);
+        auto it = std::find_if(currentItems.begin(), currentItems.end(),
+            [&name](FileItem const& fi) { return fi.name == name.c_str(); });
+
+        if (it != currentItems.end()) {
+            std::wstring pathToRemove;
+            if (it->isFolder) {
+                pathToRemove = it->fullPath;
+            } else {
+                std::filesystem::path p(it->fullPath);
+                pathToRemove = p.parent_path().wstring();
+            }
+
+            if (!pathToRemove.empty()) {
+                favorites.erase(std::remove(favorites.begin(), favorites.end(), pathToRemove), favorites.end());
+                SaveFavorites();
+                PopulateSidebar();
+            }
+        }
+        m_fileGrid.SelectedItem(nullptr);
+    }
+
+    // Hilfsfunktionen: UTF-8 Konvertierung
+    std::wstring WStringFromUtf8(std::string const& s) {
+        if (s.empty()) return {};
+        int size_needed = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), NULL, 0);
+        std::wstring w(size_needed, 0);
+        MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &w[0], size_needed);
+        return w;
+    }
+    std::string Utf8FromWString(std::wstring const& w) {
+        if (w.empty()) return {};
+        int size_needed = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), NULL, 0, NULL, NULL);
+        std::string s(size_needed, 0);
+        WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), &s[0], size_needed, NULL, NULL);
+        return s;
     }
 };
 
 int main()
 {
-    winrt::init_apartment();
+    winrt::init_apartment(winrt::apartment_type::single_threaded);
     Application::Start([](auto&&) { make<ExplorerFinal>(); });
 }
