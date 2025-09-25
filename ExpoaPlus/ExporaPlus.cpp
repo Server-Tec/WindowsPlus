@@ -20,6 +20,10 @@
 #include <winrt/Windows.UI.Xaml.Media.Imaging.h>
 #include <sstream>
 #include <iomanip>
+#include <wincrypt.h>
+#include <unordered_map>
+#include <set>
+#include <locale>
 
 using namespace winrt;
 using namespace Microsoft::UI::Xaml;
@@ -78,6 +82,12 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
     ToggleButton m_toggleDetailsButton{ nullptr };
     bool m_showDetails = false;
 
+    // AI features UI
+    Button m_aiSuggestButton{ nullptr };
+    Button m_findDuplicatesButton{ nullptr };
+    Button m_summarizeButton{ nullptr };
+    ToggleButton m_useFuzzyToggle{ nullptr };
+
     // Neue Methoden/Prototypen
     void UpdateBreadcrumb(std::wstring const& path);
     fire_and_forget ShowPreview(FileItem const& fi);
@@ -101,6 +111,13 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
     void SelectAllItems(IInspectable const&, RoutedEventArgs const&);
     void InvertSelection(IInspectable const&, RoutedEventArgs const&);
     void ToggleDetails(IInspectable const&, RoutedEventArgs const&);
+    void SuggestRename(IInspectable const&, RoutedEventArgs const&);
+    void FindDuplicates(IInspectable const&, RoutedEventArgs const&);
+    fire_and_forget SummarizeSelected(IInspectable const&, RoutedEventArgs const&);
+    std::vector<std::wstring> ExtractTagsFromTextFile(std::wstring const& path, size_t topN = 5);
+    int LevenshteinDistance(std::wstring const& a, std::wstring const& b);
+    bool FuzzyMatch(std::wstring const& hay, std::wstring const& needle, int maxDistance = 3);
+    std::string ComputeFileSHA1(std::wstring const& path);
 
     void OnLaunched(LaunchActivatedEventArgs const&)
     {
@@ -749,6 +766,121 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
         SortAndRefresh();
     }
 
+    // New helper: get full path of first selected item (works with cards or legacy string items)
+    std::wstring GetSelectedFullPath() {
+        auto sel = m_fileGrid.SelectedItem();
+        if (!sel) return {};
+        auto fe = sel.try_as<FrameworkElement>();
+        if (fe) {
+            try {
+                auto tag = fe.Tag();
+                if (tag) return std::wstring(unbox_value<hstring>(tag).c_str());
+            }
+            catch (...) {}
+        }
+        // legacy fallback
+        try {
+            hstring name = unbox_value<hstring>(sel);
+            return std::wstring(name.c_str());
+        } catch (...) {}
+        return {};
+    }
+
+    // Find FileItem by full path
+    std::vector<FileItem>::iterator FindItemByPath(std::wstring const& path) {
+        return std::find_if(currentItems.begin(), currentItems.end(), [&path](FileItem const& fi) { return fi.fullPath == path; });
+    }
+
+    // Create the Border card for GridView (used by PopulateFiles and SortAndRefresh)
+    Border CreateItemCard(FileItem const& fi) {
+        Border itemCard;
+        itemCard.CornerRadius(Microsoft::UI::Xaml::CornerRadius{ 8 });
+        itemCard.Padding(ThicknessHelper::FromUniformLength(8));
+        itemCard.Margin(ThicknessHelper::FromLengths(6, 6, 6, 6));
+        itemCard.Background(SolidColorBrush(Windows::UI::ColorHelper::FromArgb(255, 48, 48, 48)));
+
+        StackPanel cardStack;
+        cardStack.Orientation(Orientation::Vertical);
+
+        TextBlock iconTb;
+        iconTb.FontSize(28);
+        iconTb.Margin(ThicknessHelper::FromLengths(0, 0, 0, 4));
+        iconTb.Text(winrt::hstring(fi.isFolder ? L"📁" : L"📄"));
+        iconTb.Foreground(SolidColorBrush(Windows::UI::ColorHelper::FromArgb(255, 230, 230, 230)));
+
+        TextBlock nameTb;
+        nameTb.Text(winrt::hstring(fi.name));
+        nameTb.TextWrapping(TextWrapping::NoWrap);
+        nameTb.MaxWidth(220);
+        nameTb.FontSize(14);
+        nameTb.FontWeight(Windows::UI::Text::FontWeights::SemiBold());
+        nameTb.Foreground(SolidColorBrush(Windows::UI::ColorHelper::FromArgb(255, 235, 235, 235)));
+
+        cardStack.Children().Append(iconTb);
+        cardStack.Children().Append(nameTb);
+
+        if (m_showDetails) {
+            std::wstringstream ss;
+            ss << L"Size: " << fi.size << L" bytes\n";
+            SYSTEMTIME stUTC, stLocal;
+            FileTimeToSystemTime(&fi.modifiedTime, &stUTC);
+            SystemTimeToTzSpecificLocalTime(NULL, &stUTC, &stLocal);
+            ss << L"Modified: " << stLocal.wDay << L"." << stLocal.wMonth << L"." << stLocal.wYear;
+            TextBlock detailsTb;
+            detailsTb.Text(winrt::hstring(ss.str()));
+            detailsTb.FontSize(11);
+            detailsTb.Opacity(0.9);
+            detailsTb.TextWrapping(TextWrapping::Wrap);
+            detailsTb.Margin(ThicknessHelper::FromLengths(0, 4, 0, 0));
+            detailsTb.Foreground(SolidColorBrush(Windows::UI::ColorHelper::FromArgb(255, 190, 190, 190)));
+            cardStack.Children().Append(detailsTb);
+        }
+
+        itemCard.Child(cardStack);
+        itemCard.Tag(winrt::box_value(winrt::hstring(fi.fullPath)));
+        return itemCard;
+    }
+
+    // Generate several rename suggestions (AI heuristics)
+    std::vector<std::wstring> GenerateRenameSuggestions(FileItem const& fi) {
+        std::vector<std::wstring> out;
+        std::filesystem::path p(fi.fullPath);
+        std::wstring stem = p.stem().wstring();
+        std::wstring ext = p.extension().wstring();
+        // 1) Cleaned original (normalize spaces, lowercase first char)
+        auto clean = stem;
+        for (auto& c : clean) if (c == L'/' || c == L'\\' || c == L':' || c == L'*' || c == L'?' || c == L'\"' || c == L'<' || c == L'>' || c == L'|') c = L'_';
+        out.push_back(clean + ext);
+        // 2) Add date suffix if available
+        SYSTEMTIME stUTC, stLocal;
+        FileTimeToSystemTime(&fi.modifiedTime, &stUTC);
+        SystemTimeToTzSpecificLocalTime(NULL, &stUTC, &stLocal);
+        {
+            std::wstringstream ss;
+            ss << stem << L"_" << stLocal.wYear << std::setw(2) << std::setfill(L'0') << stLocal.wMonth << std::setw(2) << stLocal.wDay << ext;
+            out.push_back(ss.str());
+        }
+        // 3) Use tags for text files
+        std::wstring lowerExt = ext; std::transform(lowerExt.begin(), lowerExt.end(), lowerExt.begin(), ::towlower);
+        if (lowerExt == L".txt" || lowerExt == L".md" || lowerExt == L".csv") {
+            auto tags = ExtractTagsFromTextFile(fi.fullPath, 3);
+            if (!tags.empty()) {
+                std::wstring t = L"";
+                for (size_t i = 0; i < tags.size(); ++i) {
+                    if (i) t += L"_";
+                    t += tags[i];
+                }
+                out.push_back(stem + L"_" + t + ext);
+            }
+        }
+        // 4) Add copy variant
+        out.push_back(stem + L"_copy" + ext);
+        // Deduplicate keep order
+        std::vector<std::wstring> uniq;
+        for (auto const& s : out) if (std::find(uniq.begin(), uniq.end(), s) == uniq.end()) uniq.push_back(s);
+        return uniq;
+    }
+
     void SortAndRefresh() {
         std::sort(filteredItems.begin(), filteredItems.end(), [this](const FileItem& a, const FileItem& b) {
             int comparison = 0;
@@ -778,46 +910,36 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
 
         m_fileGrid.Items().Clear();
         for (auto const& fi : filteredItems) {
-            m_fileGrid.Items().Append(box_value(winrt::hstring(fi.name)));
+            m_fileGrid.Items().Append(CreateItemCard(fi));
         }
     }
 
     void CopyItem(IInspectable const&, RoutedEventArgs const&) {
-        auto selectedItem = m_fileGrid.SelectedItem();
-        if (!selectedItem) return;
-
-        hstring name = unbox_value<hstring>(selectedItem);
-        auto it = std::find_if(currentItems.begin(), currentItems.end(),
-            [&name](FileItem const& fi) { return fi.name == name.c_str(); });
-
-        if (it != currentItems.end()) {
-            std::wstring path = it->fullPath;
-            size_t len = sizeof(DROPFILES) + (path.length() + 2) * sizeof(wchar_t); // +2 for double null terminator
-            HGLOBAL hg = GlobalAlloc(GHND, len);
-            if (!hg) return;
-
-            DROPFILES* df = (DROPFILES*)GlobalLock(hg);
-            if (!df) {
-                GlobalFree(hg);
-                return;
-            }
-            df->pFiles = sizeof(DROPFILES);
-            df->fWide = TRUE;
-            wchar_t* dst = (wchar_t*)(df + 1);
-            wcscpy_s(dst, path.length() + 1, path.c_str());
-            dst[path.length() + 1] = L'\0'; // Double null terminate
-            GlobalUnlock(hg);
-
-            if (OpenClipboard(nullptr)) {
-                EmptyClipboard();
-                SetClipboardData(CF_HDROP, hg);
-                CloseClipboard();
-            }
-            else {
-                GlobalFree(hg);
-            }
-            m_fileGrid.SelectedItem(nullptr); // Auswahl zurücksetzen
+        std::wstring selPath = GetSelectedFullPath();
+        if (selPath.empty()) return;
+        auto it = FindItemByPath(selPath);
+        if (it == currentItems.end()) return;
+        std::wstring path = it->fullPath;
+        // Build CF_HDROP data (use double null termination)
+        size_t len = sizeof(DROPFILES) + (path.length() + 2) * sizeof(wchar_t);
+        HGLOBAL hg = GlobalAlloc(GHND, len);
+        if (!hg) return;
+        DROPFILES* df = (DROPFILES*)GlobalLock(hg);
+        if (!df) { GlobalFree(hg); return; }
+        df->pFiles = sizeof(DROPFILES);
+        df->fWide = TRUE;
+        wchar_t* dst = (wchar_t*)(df + 1);
+        wcscpy_s(dst, path.length() + 1, path.c_str());
+        dst[path.length() + 1] = L'\0';
+        GlobalUnlock(hg);
+        if (OpenClipboard(nullptr)) {
+            EmptyClipboard();
+            SetClipboardData(CF_HDROP, hg);
+            CloseClipboard();
+        } else {
+            GlobalFree(hg);
         }
+        m_fileGrid.SelectedItem(nullptr);
     }
 
     void PasteItem(IInspectable const&, RoutedEventArgs const&) {
@@ -865,78 +987,149 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
     }
 
     void DeleteItem(IInspectable const&, RoutedEventArgs const&) {
-        auto selectedItem = m_fileGrid.SelectedItem();
-        if (!selectedItem) return;
+        std::wstring selPath = GetSelectedFullPath();
+        if (selPath.empty()) return;
+        auto it = FindItemByPath(selPath);
+        if (it == currentItems.end()) return;
+        std::wstring path = it->fullPath;
+        std::vector<wchar_t> doubleNullPath(path.length() + 2, 0);
+        wcscpy_s(doubleNullPath.data(), path.length() + 1, path.c_str());
 
-        hstring name = unbox_value<hstring>(selectedItem);
-        auto it = std::find_if(currentItems.begin(), currentItems.end(),
-            [&name](FileItem const& fi) { return fi.name == name.c_str(); });
+        SHFILEOPSTRUCTW fileOp = { 0 };
+        fileOp.wFunc = FO_DELETE;
+        fileOp.pFrom = doubleNullPath.data();
+        fileOp.fFlags = FOF_ALLOWUNDO;
 
-        if (it != currentItems.end()) {
-            std::wstring path = it->fullPath;
-            std::vector<wchar_t> doubleNullPath(path.length() + 2, 0);
-            wcscpy_s(doubleNullPath.data(), path.length() + 1, path.c_str());
+        int result = SHFileOperationW(&fileOp);
+        if (result == 0 && !fileOp.fAnyOperationsAborted) PopulateFiles(m_addressBar.Text());
+        m_fileGrid.SelectedItem(nullptr); // Auswahl zurücksetzen
+    }
 
-            SHFILEOPSTRUCTW fileOp = { 0 };
-            fileOp.wFunc = FO_DELETE;
-            fileOp.pFrom = doubleNullPath.data();
-            fileOp.fFlags = FOF_ALLOWUNDO;
+    // RenameItem: show dialog with AI suggestions combo + textbox; apply chosen name
+    fire_and_forget RenameItem(IInspectable const&, RoutedEventArgs const&) {
+        std::wstring selPath = GetSelectedFullPath();
+        if (selPath.empty()) co_return;
+        auto it = FindItemByPath(selPath);
+        if (it == currentItems.end()) co_return;
 
-            int result = SHFileOperationW(&fileOp);
-            if (result == 0 && !fileOp.fAnyOperationsAborted) {
+        FileItem fi = *it;
+        // Build suggestions
+        auto suggestions = GenerateRenameSuggestions(fi);
+
+        TextBox input;
+        input.Text(winrt::hstring(fi.name));
+
+        ComboBox suggestionsCombo;
+        for (auto const& s : suggestions) suggestionsCombo.Items().Append(box_value(winrt::hstring(s)));
+        suggestionsCombo.SelectionChanged([&input](auto const&, auto const&) {
+            auto sel = suggestionsCombo.SelectedItem();
+            if (sel) input.Text(unbox_value<hstring>(sel));
+        });
+
+        StackPanel content;
+        content.Orientation(Orientation::Vertical);
+        content.Children().Append(input);
+        if (!suggestions.empty()) {
+            TextBlock hint; hint.Text(winrt::hstring(L"AI Vorschläge:")); hint.Foreground(SolidColorBrush(Windows::UI::ColorHelper::FromArgb(255,190,190,190)));
+            content.Children().Append(hint);
+            content.Children().Append(suggestionsCombo);
+        }
+
+        ContentDialog dialog;
+        dialog.Title(box_value(winrt::hstring(L"Umbenennen (AI)")));
+        dialog.Content(content);
+        dialog.PrimaryButtonText(L"OK");
+        dialog.SecondaryButtonText(L"Abbrechen");
+        dialog.XamlRoot(m_fileGrid.XamlRoot());
+
+        auto result = co_await dialog.ShowAsync();
+        if (result == ContentDialogResult::Primary) {
+            std::wstring newName = input.Text().c_str();
+            if (!newName.empty() && newName != it->name) {
+                std::filesystem::path pold(it->fullPath);
+                std::wstring newPath = pold.parent_path().wstring() + L"\\" + newName;
+                MoveFile(pold.wstring().c_str(), newPath.c_str());
                 PopulateFiles(m_addressBar.Text());
             }
-            m_fileGrid.SelectedItem(nullptr); // Auswahl zurücksetzen
         }
+        m_fileGrid.SelectedItem(nullptr);
     }
 
-    fire_and_forget RenameItem(IInspectable const&, RoutedEventArgs const&) {
-        auto selectedItem = m_fileGrid.SelectedItem();
-        if (!selectedItem) co_return;
+    // SuggestRename: show AI suggestions only (separate command), use same suggestion generator but show multiple choices
+    void SuggestRename(IInspectable const&, RoutedEventArgs const&) {
+        std::wstring selPath = GetSelectedFullPath();
+        if (selPath.empty()) return;
+        auto it = FindItemByPath(selPath);
+        if (it == currentItems.end()) return;
+        FileItem fi = *it;
+        auto suggestions = GenerateRenameSuggestions(fi);
+        if (suggestions.empty()) {
+            ContentDialog dlg; dlg.Title(box_value(winrt::hstring(L"AI Vorschläge"))); TextBlock tb; tb.Text(winrt::hstring(L"No suggestions")); dlg.Content(tb); dlg.PrimaryButtonText(L"OK"); dlg.XamlRoot(m_fileGrid.XamlRoot()); dlg.ShowAsync();
+            return;
+        }
+        // Show dialog with list of suggestions
+        StackPanel sp; sp.Orientation(Orientation::Vertical);
+        ComboBox cb; cb.PlaceholderText(L"Choose suggestion");
+        for (auto const& s : suggestions) cb.Items().Append(box_value(winrt::hstring(s)));
+        sp.Children().Append(cb);
+        TextBlock note; note.Text(winrt::hstring(L"Select a suggestion and click Apply.")); note.Foreground(SolidColorBrush(Windows::UI::ColorHelper::FromArgb(255,190,190,190)));
+        sp.Children().Append(note);
 
-        hstring name = unbox_value<hstring>(selectedItem);
-        auto it = std::find_if(currentItems.begin(), currentItems.end(),
-            [&name](FileItem const& fi) { return fi.name == name.c_str(); });
-
-        if (it != currentItems.end()) {
-            TextBox input;
-            input.Text(name);
-
-            ContentDialog dialog;
-            dialog.Title(box_value(L"Umbenennen"));
-            dialog.Content(input);
-            dialog.PrimaryButtonText(L"OK");
-            dialog.SecondaryButtonText(L"Abbrechen");
-            dialog.XamlRoot(m_fileGrid.XamlRoot());
-
-            auto result = co_await dialog.ShowAsync();
-            std::wstring newName = input.Text().c_str();
-            if (result == ContentDialogResult::Primary && !newName.empty() && newName != it->name) {
-                std::wstring oldPath = it->fullPath;
-                std::filesystem::path p(oldPath);
-                std::wstring newPath = p.parent_path().wstring() + L"\\" + newName;
-
-                if (MoveFile(oldPath.c_str(), newPath.c_str())) {
-                    PopulateFiles(m_addressBar.Text());
-                }
+        ContentDialog dlg; dlg.Title(box_value(winrt::hstring(L"AI Rename Suggestions"))); dlg.Content(sp); dlg.PrimaryButtonText(L"Apply"); dlg.SecondaryButtonText(L"Cancel"); dlg.XamlRoot(m_fileGrid.XamlRoot());
+        auto res = dlg.ShowAsync().get();
+        if (res == ContentDialogResult::Primary) {
+            auto sel = cb.SelectedItem();
+            if (sel) {
+                std::wstring chosen = unbox_value<hstring>(sel).c_str();
+                std::filesystem::path oldp(fi.fullPath);
+                std::filesystem::path newp = oldp.parent_path() / chosen;
+                try { std::filesystem::rename(oldp, newp); PopulateFiles(m_addressBar.Text()); } catch (...) {}
             }
-            m_fileGrid.SelectedItem(nullptr); // Auswahl zurücksetzen
         }
     }
 
-    std::wstring GetFavoritesPath() {
-        PWSTR path = NULL;
-        HRESULT hr = SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, NULL, &path);
-        if (SUCCEEDED(hr)) {
-            std::wstring appDataPath(path);
-            CoTaskMemFree(path);
-            std::filesystem::path p = appDataPath;
-            p /= L"UltimateExplorer";
-            std::filesystem::create_directories(p);
-            p /= L"favorites.json";
-            return p.wstring();
+    // BatchRename: use Tag-based selected items and optionally use AI suggestions pattern
+    fire_and_forget BatchRename(IInspectable const&, RoutedEventArgs const&) {
+        // Get selection as full paths
+        std::vector<std::wstring> selPaths;
+        for (uint32_t i = 0; i < m_fileGrid.SelectedItems().Size(); ++i) {
+            auto item = m_fileGrid.SelectedItems().GetAt(i);
+            auto fe = item.try_as<FrameworkElement>();
+            if (!fe) continue;
+            try { selPaths.push_back(unbox_value<hstring>(fe.Tag()).c_str()); } catch (...) {}
         }
-        return L"favorites.json"; // Fallback
+        if (selPaths.empty()) co_return;
+
+        // Ask user for pattern or AI mode
+        StackPanel content; content.Orientation(Orientation::Vertical);
+        TextBox patternBox; patternBox.PlaceholderText(L"Pattern (use {n} for index, leave empty to use AI)");
+        content.Children().Append(patternBox);
+        ContentDialog dlg; dlg.Title(box_value(winrt::hstring(L"Batch-Rename (Pattern or AI)"))); dlg.Content(content); dlg.PrimaryButtonText(L"Apply"); dlg.SecondaryButtonText(L"Cancel"); dlg.XamlRoot(m_fileGrid.XamlRoot());
+        auto res = co_await dlg.ShowAsync();
+        if (res != ContentDialogResult::Primary) co_return;
+        std::wstring pattern = patternBox.Text().c_str();
+
+        int idx = 1;
+        for (auto const& path : selPaths) {
+            auto it = FindItemByPath(path);
+            if (it == currentItems.end()) continue;
+            std::wstring newName;
+            if (!pattern.empty()) {
+                newName = pattern;
+                size_t pos = newName.find(L"{n}");
+                if (pos != std::wstring::npos) {
+                    newName.replace(pos, 3, std::to_wstring(idx++));
+                }
+            } else {
+                // AI suggestion for this item
+                auto sugg = GenerateRenameSuggestions(*it);
+                newName = sugg.empty() ? it->name : sugg.front();
+            }
+            std::filesystem::path oldp(it->fullPath);
+            std::filesystem::path newp = oldp.parent_path() / newName;
+            try { std::filesystem::rename(oldp, newp); } catch (...) {}
+        }
+        PopulateFiles(m_addressBar.Text());
     }
 
     // Hilfsfunktionen: Suche selektiertes Element
