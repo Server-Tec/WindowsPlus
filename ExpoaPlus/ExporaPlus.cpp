@@ -16,6 +16,10 @@
 #include <fstream>
 #include <json/json.h>
 #include <winrt/Windows.System.h> // <-- neu: VirtualKey / hresult handling support
+#include <winrt/Windows.Storage.Streams.h>
+#include <winrt/Windows.UI.Xaml.Media.Imaging.h>
+#include <sstream>
+#include <iomanip>
 
 using namespace winrt;
 using namespace Microsoft::UI::Xaml;
@@ -45,21 +49,47 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
     int sortColumn = 0; // 0=Name,1=Type,2=Size,3=Date
     std::vector<std::wstring> favorites;
 
-    // Neue Member für Kontextmenü (damit lambdas / Opening handler sicher darauf zugreifen)
-    MenuFlyoutItem m_addFavItem{ nullptr };
-    MenuFlyoutItem m_remFavItem{ nullptr };
+    // --- Neue Members ---
+    StackPanel m_breadcrumb{ nullptr };
+    Image m_previewImage{ nullptr };
+    TextBlock m_previewText{ nullptr };
+    Border m_previewBorder{ nullptr };
+    ToggleSwitch m_recursiveToggle{ nullptr };
+    Button m_analyzeButton{ nullptr };
+    Button m_batchRenameButton{ nullptr };
+    std::vector<std::wstring> recentFiles;
 
-    void CopyItem(IInspectable const&, RoutedEventArgs const&);
-    void DeleteItem(IInspectable const&, RoutedEventArgs const&);
-    void RenameItem(IInspectable const&, RoutedEventArgs const&);
-    void PasteItem(IInspectable const&, RoutedEventArgs const&);
-    void SortByName(IInspectable const&, RoutedEventArgs const&);
-    void SortBySize(IInspectable const&, RoutedEventArgs const&);
-    void SortByDate(IInspectable const&, RoutedEventArgs const&);
-    void SortByType(IInspectable const&, RoutedEventArgs const&);
-    void SortAndRefresh();
-    void AddToFavorites(IInspectable const&, RoutedEventArgs const&);
-    void RemoveFromFavorites(IInspectable const&, RoutedEventArgs const&);
+    // Neue UI / Funktionalitäts-Erweiterungen
+    ComboBox m_searchHistoryCombo{ nullptr };
+    Button m_searchButton{ nullptr };
+    Button m_compressButton{ nullptr };
+    Button m_extractButton{ nullptr };
+    Button m_propertiesButton{ nullptr };
+    Button m_copyPathButton{ nullptr };
+    Button m_openTerminalButton{ nullptr };
+    ToggleButton m_toggleHiddenButton{ nullptr };
+    bool m_showHidden = false;
+    std::vector<std::wstring> searchHistory;
+
+    // Neue Methoden/Prototypen
+    void UpdateBreadcrumb(std::wstring const& path);
+    fire_and_forget ShowPreview(FileItem const& fi);
+    void FileSelectionChanged(IInspectable const&, SelectionChangedEventArgs const&);
+    void RecursiveSearch(std::wstring const& path, std::wstring const& filter, std::vector<FileItem>& outItems);
+    fire_and_forget BatchRename(IInspectable const&, RoutedEventArgs const&);
+    fire_and_forget AnalyzeSizes(IInspectable const&, RoutedEventArgs const&);
+    void LoadRecent();
+    void SaveRecent();
+    void AddToRecent(std::wstring const& path);
+
+    // Neue Prototypen
+    void PerformSearch();
+    void ToggleShowHidden(IInspectable const&, RoutedEventArgs const&);
+    void CompressSelected(IInspectable const&, RoutedEventArgs const&);
+    void ExtractSelected(IInspectable const&, RoutedEventArgs const&);
+    void CopyPathToClipboard(IInspectable const&, RoutedEventArgs const&);
+    void OpenInTerminal(IInspectable const&, RoutedEventArgs const&);
+    void ShowProperties(IInspectable const&, RoutedEventArgs const&);
 
     void OnLaunched(LaunchActivatedEventArgs const&)
     {
@@ -98,8 +128,57 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
         sortPanel.Children().Append(sortSize);
         sortPanel.Children().Append(sortType); // <-- neu
         sortPanel.Children().Append(sortDate);
-        Grid::SetRow(sortPanel, 2);
-        mainGrid.Children().Append(sortPanel);
+
+        // Füge rekursiven Suche-Toggle + Analyse + Batch-Rename Buttons in SortPanel
+        m_recursiveToggle = ToggleSwitch();
+        m_recursiveToggle.IsOn(false);
+        m_recursiveToggle.OnContent(winrt::box_value(winrt::hstring(L"Rekursiv")));
+        sortPanel.Children().Append(m_recursiveToggle);
+
+        m_analyzeButton = Button();
+        m_analyzeButton.Content(winrt::box_value(winrt::hstring(L"Analyze Sizes")));
+        m_analyzeButton.Click({ this, &ExplorerFinal::AnalyzeSizes });
+        sortPanel.Children().Append(m_analyzeButton);
+
+        m_batchRenameButton = Button();
+        m_batchRenameButton.Content(winrt::box_value(winrt::hstring(L"Batch-Rename")));
+        m_batchRenameButton.Click({ this, &ExplorerFinal::BatchRename });
+        sortPanel.Children().Append(m_batchRenameButton);
+
+        // Neue Buttons: Compress / Extract / Properties / CopyPath / OpenTerminal / ToggleHidden
+        m_compressButton = Button(); m_compressButton.Content(winrt::box_value(winrt::hstring(L"Compress"))); m_compressButton.Click({ this, &ExplorerFinal::CompressSelected });
+        m_extractButton = Button(); m_extractButton.Content(winrt::box_value(winrt::hstring(L"Extract"))); m_extractButton.Click({ this, &ExplorerFinal::ExtractSelected });
+        m_propertiesButton = Button(); m_propertiesButton.Content(winrt::box_value(winrt::hstring(L"Properties"))); m_propertiesButton.Click({ this, &ExplorerFinal::ShowProperties });
+        m_copyPathButton = Button(); m_copyPathButton.Content(winrt::box_value(winrt::hstring(L"Copy Path"))); m_copyPathButton.Click({ this, &ExplorerFinal::CopyPathToClipboard });
+        m_openTerminalButton = Button(); m_openTerminalButton.Content(winrt::box_value(winrt::hstring(L"Open Terminal"))); m_openTerminalButton.Click({ this, &ExplorerFinal::OpenInTerminal });
+        m_toggleHiddenButton = ToggleButton(); m_toggleHiddenButton.Content(winrt::box_value(winrt::hstring(L"Show Hidden"))); m_toggleHiddenButton.Checked({ this, &ExplorerFinal::ToggleShowHidden }); m_toggleHiddenButton.Unchecked({ this, &ExplorerFinal::ToggleShowHidden });
+
+        sortPanel.Children().Append(m_compressButton);
+        sortPanel.Children().Append(m_extractButton);
+        sortPanel.Children().Append(m_propertiesButton);
+        sortPanel.Children().Append(m_copyPathButton);
+        sortPanel.Children().Append(m_openTerminalButton);
+        sortPanel.Children().Append(m_toggleHiddenButton);
+
+        // Search UI: Button + History ComboBox
+        StackPanel searchStack;
+        searchStack.Orientation(Orientation::Horizontal);
+        m_searchHistoryCombo = ComboBox();
+        m_searchHistoryCombo.PlaceholderText(L"History");
+        m_searchHistoryCombo.SelectionChanged([this](auto const&, auto const&) {
+            auto sel = m_searchHistoryCombo.SelectedItem();
+            if (sel) m_searchBox.Text(unbox_value<hstring>(sel));
+        });
+        m_searchButton = Button();
+        m_searchButton.Content(winrt::box_value(winrt::hstring(L"Search")));
+        m_searchButton.Click([this](auto const&, auto const&) { PerformSearch(); });
+
+        searchStack.Children().Append(m_searchBox);
+        searchStack.Children().Append(m_searchButton);
+        searchStack.Children().Append(m_searchHistoryCombo);
+        Grid::SetRow(searchStack, 1);
+        // replace previous single-searchBox append with the stack
+        mainGrid.Children().Append(searchStack);
 
         // Datei-GridView
         m_fileGrid = GridView();
@@ -154,11 +233,15 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
 
         m_navView.Content(mainGrid);
         LoadFavorites();
+        LoadRecent();
         PopulateSidebar();
         PopulateFiles(m_addressBar.Text());
 
         m_window.Content(m_navView);
         m_window.Activate();
+
+        // initiale Breadcrumb aktualisieren
+        UpdateBreadcrumb(m_addressBar.Text().c_str());
     }
 
     // Sidebar: Laufwerke + Favoriten
@@ -204,6 +287,10 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
 
         do {
             if (wcscmp(fd.cFileName, L".") != 0 && wcscmp(fd.cFileName, L"..") != 0) {
+                // Skip hidden files unless enabled
+                bool isHidden = (fd.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN) != 0;
+                if (isHidden && !m_showHidden) continue;
+
                 FileItem fi;
                 fi.name = fd.cFileName;
                 fi.fullPath = dir + L"\\" + fd.cFileName;
@@ -256,73 +343,259 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
             if (it->isFolder) {
                 m_addressBar.Text(it->fullPath);
                 PopulateFiles(it->fullPath);
+                UpdateBreadcrumb(it->fullPath);
             }
             else {
                 ShellExecute(nullptr, L"open", it->fullPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                AddToRecent(it->fullPath);
             }
         }
     }
 
-    // Drag & Drop: mehrere Dateien
-    void DragStart(IInspectable const&, DragItemsStartingEventArgs const& args) {
-        std::vector<IStorageItem> itemsToDrag;
-        for (auto const& item : args.Items()) {
-            hstring name = unbox_value<hstring>(item);
-            auto it = std::find_if(currentItems.begin(), currentItems.end(),
-                [&name](FileItem const& fi) { return fi.name == name.c_str(); });
-
-            if (it != currentItems.end()) {
-                if (it->isFolder) {
-                    itemsToDrag.push_back(StorageFolder::GetFolderFromPathAsync(it->fullPath).get());
-                }
-                else {
-                    itemsToDrag.push_back(StorageFile::GetFileFromPathAsync(it->fullPath).get());
-                }
-            }
+    void FileSelectionChanged(IInspectable const&, SelectionChangedEventArgs const&) {
+        auto sel = m_fileGrid.SelectedItem();
+        if (!sel) {
+            m_previewImage.Source(nullptr);
+            m_previewText.Text(L"");
+            return;
         }
-
-        if (!itemsToDrag.empty()) {
-            auto dataPackage = DataPackage();
-            dataPackage.SetStorageItems(itemsToDrag);
-            dataPackage.RequestedOperation(DataPackageOperation::Move);
-            args.Data(dataPackage);
+        hstring name = unbox_value<hstring>(sel);
+        auto it = std::find_if(currentItems.begin(), currentItems.end(),
+            [&name](FileItem const& fi) { return fi.name == name.c_str(); });
+        if (it != currentItems.end()) {
+            // Show preview asynchronously
+            ShowPreview(*it);
         }
     }
 
-    fire_and_forget DropFiles(IInspectable const&, DragEventArgs const& args) {
+    fire_and_forget ShowPreview(FileItem const& fi) {
         try {
-            if (args.DataView().Contains(StandardDataFormats::StorageItems())) {
-                auto items = co_await args.DataView().GetStorageItemsAsync();
-                auto destPath = m_addressBar.Text();
-
-                for (auto const& item : items) {
-                    try {
-                        if (item.IsOfType(StorageItemTypes::File)) {
-                            auto file = item.as<StorageFile>();
-                            auto destFolder = co_await StorageFolder::GetFolderFromPathAsync(destPath);
-                            co_await file.MoveAsync(destFolder);
-                        } else if (item.IsOfType(StorageItemTypes::Folder)) {
-                            auto folder = item.as<StorageFolder>();
-                            auto destFolder = co_await StorageFolder::GetFolderFromPathAsync(destPath);
-                            co_await folder.MoveAsync(destFolder);
-                        }
-                    } catch (const winrt::hresult_error& e) {
-                        // Log or handle the error for individual items
-                        std::wstring msg = L"Error moving item: ";
-                        msg += e.message().c_str();
-                        msg += L"\n";
-                        OutputDebugStringW(msg.c_str());
-                    }
-                }
-                PopulateFiles(destPath);
+            if (fi.isFolder) {
+                m_previewImage.Source(nullptr);
+                m_previewText.Text(winrt::hstring(L"Folder: " + fi.name));
+                co_return;
             }
-        } catch (const winrt::hresult_error& e) {
-            // Log or handle the error for the entire operation
-            std::wstring msg = L"Error during drag-and-drop: ";
-            msg += e.message().c_str();
-            msg += L"\n";
-            OutputDebugStringW(msg.c_str());
+            auto path = fi.fullPath;
+            auto ext = std::filesystem::path(path).extension().wstring();
+            // simple image preview by extension
+            std::wstring extLower = ext;
+            std::transform(extLower.begin(), extLower.end(), extLower.begin(), ::towlower);
+            if (extLower == L".png" || extLower == L".jpg" || extLower == L".jpeg" || extLower == L".bmp" || extLower == L".gif") {
+                try {
+                    auto file = co_await StorageFile::GetFileFromPathAsync(hstring(path));
+                    auto stream = co_await file.OpenReadAsync();
+                    auto bitmap = winrt::Windows::UI::Xaml::Media::Imaging::BitmapImage();
+                    bitmap.SetSource(stream);
+                    m_previewImage.Source(bitmap);
+                    m_previewText.Text(winrt::hstring(L"Image: " + fi.name));
+                } catch (...) {
+                    m_previewImage.Source(nullptr);
+                    m_previewText.Text(winrt::hstring(L"Unable to preview image."));
+                }
+                co_return;
+            }
+
+            // text preview for small text files
+            if (extLower == L".txt" || extLower == L".csv" || extLower == L".log" || extLower == L".md") {
+                try {
+                    auto file = co_await StorageFile::GetFileFromPathAsync(hstring(path));
+                    auto text = co_await FileIO::ReadTextAsync(file);
+                    std::wstring preview;
+                    auto s = text.c_str();
+                    preview = s;
+                    if (preview.size() > 4000) preview = preview.substr(0, 4000) + L"...";
+                    m_previewImage.Source(nullptr);
+                    m_previewText.Text(winrt::hstring(preview));
+                } catch (...) {
+                    m_previewText.Text(winrt::hstring(L"Unable to load text preview."));
+                }
+                co_return;
+            }
+
+            // fallback: basic properties
+            std::wstringstream ss;
+            ss << L"Name: " << fi.name << L"\n";
+            ss << L"Path: " << fi.fullPath << L"\n";
+            ss << L"Size: " << fi.size << L" bytes\n";
+            // convert sys time to readable
+            SYSTEMTIME stUTC, stLocal;
+            FileTimeToSystemTime(&fi.modifiedTime, &stUTC);
+            SystemTimeToTzSpecificLocalTime(NULL, &stUTC, &stLocal);
+            ss << L"Modified: " << stLocal.wDay << L"." << stLocal.wMonth << L"." << stLocal.wYear;
+            m_previewImage.Source(nullptr);
+            m_previewText.Text(winrt::hstring(ss.str()));
+        } catch (...) {
+            m_previewText.Text(winrt::hstring(L"Preview error."));
         }
+    }
+
+    // Breadcrumb helper
+    void UpdateBreadcrumb(std::wstring const& path) {
+        m_breadcrumb.Children().Clear();
+        if (path.empty()) return;
+        std::wstring p = path;
+        if (p.back() == L'\\') p.pop_back();
+        std::vector<std::wstring> parts;
+        std::wstring temp;
+        for (size_t i = 0; i < p.size(); ++i) {
+            temp.push_back(p[i]);
+            if (p[i] == L'\\') {
+                parts.push_back(temp);
+            }
+        }
+        // if final part not added (no trailing backslash)
+        if (parts.empty()) parts.push_back(p + L"\\");
+        // build breadcrumb buttons
+        for (auto const& part : parts) {
+            Button b;
+            b.Content(winrt::box_value(winrt::hstring(part)));
+            std::wstring tag = part;
+            b.Click([this, tag](auto&&, auto&&) {
+                m_addressBar.Text(tag);
+                PopulateFiles(m_addressBar.Text());
+                UpdateBreadcrumb(tag);
+            });
+            m_breadcrumb.Children().Append(b);
+        }
+    }
+
+    // Rekursive Suche
+    void RecursiveSearch(std::wstring const& path, std::wstring const& filter, std::vector<FileItem>& outItems) {
+        try {
+            for (auto const& entry : std::filesystem::directory_iterator(path)) {
+                try {
+                    auto name = entry.path().filename().wstring();
+                    WIN32_FIND_DATA fd;
+                    FileItem fi;
+                    fi.name = name;
+                    fi.fullPath = entry.path().wstring();
+                    fi.isFolder = entry.is_directory();
+                    if (!fi.isFolder) {
+                        auto f = std::filesystem::file_size(entry.path());
+                        fi.size = f;
+                    } else fi.size = 0;
+                    if (fi.name.find(filter) != std::wstring::npos) outItems.push_back(fi);
+                    if (entry.is_directory()) {
+                        RecursiveSearch(entry.path().wstring(), filter, outItems);
+                    }
+                } catch (...) { /* ignore individual errors */ }
+            }
+        } catch (...) { /* ignore access errors */ }
+    }
+
+    // Batch-Rename: Pattern example: "File_{n}" where {n} replaced with index
+    fire_and_forget BatchRename(IInspectable const&, RoutedEventArgs const&) {
+        auto sel = m_fileGrid.SelectedItem();
+        if (!sel) co_return;
+        TextBox input;
+        input.PlaceholderText(L"Pattern, use {n} for index, e.g. Photo_{n}");
+        ContentDialog dlg;
+        dlg.Title(winrt::box_value(winrt::hstring(L"Batch-Rename")));
+        dlg.Content(input);
+        dlg.PrimaryButtonText(L"OK");
+        dlg.SecondaryButtonText(L"Cancel");
+        dlg.XamlRoot(m_fileGrid.XamlRoot());
+        auto res = co_await dlg.ShowAsync();
+        if (res != ContentDialogResult::Primary) co_return;
+        hstring pattern = input.Text();
+        std::vector<std::wstring> selectedNames;
+        for (auto const& s : m_fileGrid.SelectedItems()) {
+            selectedNames.push_back(std::wstring(unbox_value<hstring>(s).c_str()));
+        }
+        int idx = 1;
+        for (auto const& nm : selectedNames) {
+            auto it = std::find_if(currentItems.begin(), currentItems.end(),
+                [&nm](FileItem const& fi) { return fi.name == nm; });
+            if (it == currentItems.end()) continue;
+            std::wstring pat = pattern.c_str();
+            // replace {n}
+            size_t pos = pat.find(L"{n}");
+            std::wstringstream ss;
+            ss << idx++;
+            if (pos != std::wstring::npos) pat.replace(pos, 3, ss.str());
+            std::filesystem::path oldp(it->fullPath);
+            std::filesystem::path newp = oldp.parent_path() / pat;
+            try {
+                std::filesystem::rename(oldp, newp);
+            } catch (...) {}
+        }
+        PopulateFiles(m_addressBar.Text());
+    }
+
+    // Größenanalyse: berechnet rekursiv Größen für Items in current directory
+    static ULONGLONG ComputeSizeRecursive(std::wstring const& path) {
+        ULONGLONG total = 0;
+        try {
+            for (auto const& e : std::filesystem::recursive_directory_iterator(path)) {
+                try {
+                    if (e.is_regular_file()) total += (ULONGLONG)std::filesystem::file_size(e.path());
+                } catch (...) {}
+            }
+        } catch (...) {}
+        return total;
+    }
+    fire_and_forget AnalyzeSizes(IInspectable const&, RoutedEventArgs const&) {
+        std::vector<std::pair<std::wstring, ULONGLONG>> sizes;
+        for (auto& fi : currentItems) {
+            if (fi.isFolder) {
+                ULONGLONG s = ComputeSizeRecursive(fi.fullPath);
+                sizes.push_back({ fi.name, s });
+            } else {
+                sizes.push_back({ fi.name, fi.size });
+            }
+        }
+        std::sort(sizes.begin(), sizes.end(), [](auto const& a, auto const& b) { return a.second > b.second; });
+        std::wstringstream ss;
+        ss << L"Top items by size:\n\n";
+        int count = 0;
+        for (auto const& p : sizes) {
+            ss << p.first << L" - " << p.second << L" bytes\n";
+            if (++count >= 15) break;
+        }
+        ContentDialog dlg;
+        dlg.Title(winrt::box_value(winrt::hstring(L"Size Analysis")));
+        TextBlock tb;
+        tb.Text(winrt::hstring(ss.str()));
+        tb.TextWrapping(TextWrapping::Wrap);
+        dlg.Content(tb);
+        dlg.PrimaryButtonText(L"OK");
+        dlg.XamlRoot(m_fileGrid.XamlRoot());
+        co_await dlg.ShowAsync();
+    }
+
+    // Recent handling (simple)
+    void AddToRecent(std::wstring const& path) {
+        if (path.empty()) return;
+        recentFiles.erase(std::remove(recentFiles.begin(), recentFiles.end(), path), recentFiles.end());
+        recentFiles.insert(recentFiles.begin(), path);
+        if (recentFiles.size() > 50) recentFiles.resize(50);
+        SaveRecent();
+    }
+    void LoadRecent() {
+        recentFiles.clear();
+        std::ifstream f(GetFavoritesPath() + L".recent", std::ios::binary);
+        if (!f.is_open()) return;
+        try {
+            std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            Json::CharReaderBuilder rbuilder;
+            std::unique_ptr<Json::CharReader> reader(rbuilder.newCharReader());
+            Json::Value root; std::string errs;
+            if (reader->parse(content.c_str(), content.c_str()+content.size(), &root, &errs)) {
+                if (root.isMember("recent") && root["recent"].isArray()) {
+                    for (auto& v : root["recent"]) recentFiles.push_back(WStringFromUtf8(v.asString()));
+                }
+            }
+        } catch (...) {}
+    }
+    void SaveRecent() {
+        try {
+            Json::Value root;
+            for (auto const& r : recentFiles) root["recent"].append(Utf8FromWString(r));
+            Json::StreamWriterBuilder wbuilder; wbuilder["indentation"] = "  ";
+            auto out = Json::writeString(wbuilder, root);
+            std::ofstream f(GetFavoritesPath() + L".recent", std::ios::binary);
+            if (f.is_open()) f << out;
+        } catch (...) {}
     }
 
     // Copy/Delete/Rename / Sortierung / Favoriten speichern + laden hier implementieren
