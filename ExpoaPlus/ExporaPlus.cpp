@@ -119,6 +119,7 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
     bool FuzzyMatch(std::wstring const& hay, std::wstring const& needle, int maxDistance = 3);
     std::string ComputeFileSHA1(std::wstring const& path);
 
+    // OnLaunched: Toolbar - AI buttons + Fuzzy toggle
     void OnLaunched(LaunchActivatedEventArgs const&)
     {
         m_window = Window();
@@ -148,14 +149,21 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
         m_addressBar = TextBox();
         m_addressBar.Text(L"C:\\");
         m_addressBar.KeyUp({ this, &ExplorerFinal::AddressBarKeyUp });
-        mainGrid.Children().Append(m_addressBar);
+        // Breadcrumb + Address in a vertical stack
+        m_breadcrumb = StackPanel();
+        m_breadcrumb.Orientation(Orientation::Horizontal);
+        StackPanel addressStack;
+        addressStack.Orientation(Orientation::Vertical);
+        addressStack.Children().Append(m_addressBar);
+        addressStack.Children().Append(m_breadcrumb);
+        mainGrid.Children().Append(addressStack);
 
         // Suchleiste
         m_searchBox = TextBox();
         m_searchBox.PlaceholderText(L"Suchen...");
         m_searchBox.TextChanged({ this, &ExplorerFinal::SearchTextChanged });
         Grid::SetRow(m_searchBox, 1);
-        mainGrid.Children().Append(m_searchBox);
+        // NOTE: actual search UI stack appended later (searchStack). Do not append m_searchBox directly here.
 
         // Sortierleiste: zusätzlicher "Typ"-Button
         StackPanel sortPanel;
@@ -205,6 +213,26 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
         styleBtn(m_batchRenameButton);
         sortPanel.Children().Append(m_batchRenameButton);
 
+        // Selection and UI enhancement buttons
+        m_selectAllButton = Button(); m_selectAllButton.Content(box_value(winrt::hstring(L"Select All"))); m_selectAllButton.Click({ this, &ExplorerFinal::SelectAllItems }); styleBtn(m_selectAllButton);
+        m_invertSelectionButton = Button(); m_invertSelectionButton.Content(box_value(winrt::hstring(L"Invert Sel"))); m_invertSelectionButton.Click({ this, &ExplorerFinal::InvertSelection }); styleBtn(m_invertSelectionButton);
+        m_duplicateButton = Button(); m_duplicateButton.Content(box_value(winrt::hstring(L"Duplicate"))); m_duplicateButton.Click({ this, &ExplorerFinal::DuplicateSelected }); styleBtn(m_duplicateButton);
+        m_toggleDetailsButton = ToggleButton(); m_toggleDetailsButton.Content(box_value(winrt::hstring(L"Details"))); m_toggleDetailsButton.Checked({ this, &ExplorerFinal::ToggleDetails }); m_toggleDetailsButton.Unchecked({ this, &ExplorerFinal::ToggleDetails }); m_toggleDetailsButton.Background(accentBrush); m_toggleDetailsButton.Foreground(textBrush);
+        sortPanel.Children().Append(m_selectAllButton);
+        sortPanel.Children().Append(m_invertSelectionButton);
+        sortPanel.Children().Append(m_duplicateButton);
+        sortPanel.Children().Append(m_toggleDetailsButton);
+
+        // AI toolbar buttons
+        m_aiSuggestButton = Button(); m_aiSuggestButton.Content(winrt::box_value(winrt::hstring(L"AI Rename"))); m_aiSuggestButton.Click({ this, &ExplorerFinal::SuggestRename }); styleBtn(m_aiSuggestButton);
+        m_findDuplicatesButton = Button(); m_findDuplicatesButton.Content(winrt::box_value(winrt::hstring(L"Find Dups"))); m_findDuplicatesButton.Click({ this, &ExplorerFinal::FindDuplicates }); styleBtn(m_findDuplicatesButton);
+        m_summarizeButton = Button(); m_summarizeButton.Content(winrt::box_value(winrt::hstring(L"Summarize"))); m_summarizeButton.Click({ this, &ExplorerFinal::SummarizeSelected }); styleBtn(m_summarizeButton);
+        m_useFuzzyToggle = ToggleButton(); m_useFuzzyToggle.Content(winrt::box_value(winrt::hstring(L"Fuzzy Search"))); m_useFuzzyToggle.Background(accentBrush); m_useFuzzyToggle.Foreground(textBrush); m_useFuzzyToggle.CornerRadius(Microsoft::UI::Xaml::CornerRadius{6});
+        sortPanel.Children().Append(m_aiSuggestButton);
+        sortPanel.Children().Append(m_findDuplicatesButton);
+        sortPanel.Children().Append(m_summarizeButton);
+        sortPanel.Children().Append(m_useFuzzyToggle);
+
         // Neue Buttons: Compress / Extract / Properties / CopyPath / OpenTerminal / ToggleHidden
         m_compressButton = Button(); m_compressButton.Content(winrt::box_value(winrt::hstring(L"Compress"))); m_compressButton.Click({ this, &ExplorerFinal::CompressSelected });
         m_extractButton = Button(); m_extractButton.Content(winrt::box_value(winrt::hstring(L"Extract"))); m_extractButton.Click({ this, &ExplorerFinal::ExtractSelected });
@@ -250,23 +278,50 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
         // replace previous single-searchBox append with the stack
         mainGrid.Children().Append(searchStack);
 
-        // Datei-GridView & content: ensure background and previews use dark scheme
+        // Content grid: left = files, right = preview
+        Grid contentGrid;
+        ColumnDefinition colFiles; colFiles.Width(GridLengthHelper::Star());
+        ColumnDefinition colPreview; colPreview.Width(GridLengthHelper::Auto());
+        contentGrid.ColumnDefinitions().Append(colFiles);
+        contentGrid.ColumnDefinitions().Append(colPreview);
+        Grid::SetRow(contentGrid, 3);
+
+        // Datei-GridView (left)
         m_fileGrid = GridView();
-        Grid::SetRow(m_fileGrid, 3);
         m_fileGrid.IsItemClickEnabled(true);
-        m_fileGrid.Background(panelBrush);        // grid background
+        m_fileGrid.SelectionMode(Microsoft::UI::Xaml::Controls::ListViewSelectionMode::Multiple);
+        m_fileGrid.IsMultiSelectCheckBoxEnabled(true);
         m_fileGrid.ItemClick({ this, &ExplorerFinal::FileItemClick });
+        m_fileGrid.SelectionChanged({ this, &ExplorerFinal::FileSelectionChanged });
         m_fileGrid.AllowDrop(true);
         m_fileGrid.DragItemsStarting({ this, &ExplorerFinal::DragStart });
         m_fileGrid.Drop({ this, &ExplorerFinal::DropFiles });
+        m_fileGrid.Background(panelBrush);
+        Grid::SetColumn(m_fileGrid, 0);
+        contentGrid.Children().Append(m_fileGrid);
 
-        // Preview border styling
-        if (m_previewBorder) {
-            m_previewBorder.Background(previewBrush);
-            m_previewBorder.BorderBrush(accentBrush);
-        }
+        // Preview pane (right)
+        m_previewBorder = Border();
+        m_previewBorder.Padding(ThicknessHelper::FromUniformLength(8));
+        m_previewBorder.Width(360);
+        m_previewBorder.Background(previewBrush);
+        m_previewBorder.BorderBrush(accentBrush);
+        m_previewBorder.CornerRadius(Microsoft::UI::Xaml::CornerRadius{ 8 });
+        StackPanel previewStack;
+        previewStack.Orientation(Orientation::Vertical);
+        m_previewImage = Image();
+        m_previewImage.MaxHeight(240);
+        m_previewImage.MaxWidth(320);
+        previewStack.Children().Append(m_previewImage);
+        m_previewText = TextBlock();
+        m_previewText.TextWrapping(TextWrapping::Wrap);
+        m_previewText.Foreground(textBrush);
+        previewStack.Children().Append(m_previewText);
+        m_previewBorder.Child(previewStack);
+        Grid::SetColumn(m_previewBorder, 1);
+        contentGrid.Children().Append(m_previewBorder);
 
-        mainGrid.Children().Append(m_fileGrid);
+        mainGrid.Children().Append(contentGrid);
 
         // Kontextmenü: now use member items so Opening-handler can update them
         MenuFlyout flyout;
@@ -287,12 +342,11 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
 
         // Opening-Handler: aktivieren/deaktivieren je nach Auswahl / Favoriten-Status
         flyout.Opening([this](auto const&, auto const&) {
-            auto sel = m_fileGrid.SelectedItem();
+            std::wstring selPath = GetSelectedFullPath();
             bool enableAdd = false;
             bool enableRem = false;
-            if (sel) {
-                hstring name = unbox_value<hstring>(sel);
-                auto it = FindItemByName(name);
+            if (!selPath.empty()) {
+                auto it = FindItemByPath(selPath);
                 if (it != currentItems.end()) {
                     std::wstring path = it->fullPath;
                     bool isFav = (std::find(favorites.begin(), favorites.end(), path) != favorites.end());
@@ -436,137 +490,36 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
         SortAndRefresh();
     }
 
-    // Suchleiste filter
+    // Suchleiste filter: delegiere an PerformSearch (unterstützt Fuzzy + Rekursion)
     void SearchTextChanged(IInspectable const&, TextChangedEventArgs const&) {
+        PerformSearch();
+    }
+
+    void PerformSearch() {
         std::wstring filter = m_searchBox.Text().c_str();
+        if (!filter.empty()) {
+            auto it = std::find(searchHistory.begin(), searchHistory.end(), filter);
+            if (it != searchHistory.end()) searchHistory.erase(it);
+            searchHistory.insert(searchHistory.begin(), filter);
+            if (searchHistory.size() > 25) searchHistory.resize(25);
+            m_searchHistoryCombo.Items().Clear();
+            for (auto const& s : searchHistory) m_searchHistoryCombo.Items().Append(box_value(winrt::hstring(s)));
+        }
+
         filteredItems.clear();
-        for (auto& fi : currentItems) {
-            if (fi.name.find(filter) != std::wstring::npos) {
-                filteredItems.push_back(fi);
+        bool useFuzzy = m_useFuzzyToggle && m_useFuzzyToggle.IsChecked().HasValue() && m_useFuzzyToggle.IsChecked().Value();
+        if (m_recursiveToggle && m_recursiveToggle.IsOn()) {
+            RecursiveSearch(m_addressBar.Text().c_str(), filter, filteredItems);
+        } else {
+            for (auto& fi : currentItems) {
+                if (useFuzzy) {
+                    if (FuzzyMatch(fi.name, filter)) filteredItems.push_back(fi);
+                } else {
+                    if (fi.name.find(filter) != std::wstring::npos) filteredItems.push_back(fi);
+                }
             }
         }
         SortAndRefresh();
-    }
-
-    void AddressBarKeyUp(IInspectable const&, KeyRoutedEventArgs const& args) {
-        if (args.Key() == Windows::System::VirtualKey::Enter)
-            PopulateFiles(m_addressBar.Text());
-    }
-
-    // Adjusted FileItemClick: retrieve path from Tag if item is a UI element
-    void FileItemClick(IInspectable const&, ItemClickEventArgs const& args) {
-        auto clickedObj = args.ClickedItem();
-        auto fe = clickedObj.try_as<FrameworkElement>();
-        std::wstring clickedPath;
-        if (fe) {
-            try {
-                clickedPath = unbox_value<hstring>(fe.Tag()).c_str();
-            } catch (...) { /* fallback */ }
-        } else {
-            // legacy: clicked item may be a string
-            try {
-                clickedPath = unbox_value<hstring>(clickedObj).c_str();
-            } catch (...) {}
-        }
-
-        if (clickedPath.empty()) return;
-
-        auto it = std::find_if(filteredItems.begin(), filteredItems.end(),
-            [&clickedPath](FileItem& fi) { return fi.fullPath == clickedPath; });
-
-        if (it != filteredItems.end()) {
-            if (it->isFolder) {
-                m_addressBar.Text(it->fullPath);
-                PopulateFiles(it->fullPath);
-                UpdateBreadcrumb(it->fullPath);
-            } else {
-                ShellExecute(nullptr, L"open", it->fullPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-                AddToRecent(it->fullPath);
-            }
-        }
-    }
-
-    // Adjusted SelectionChanged preview: use Tag to find FileItem
-    void FileSelectionChanged(IInspectable const&, SelectionChangedEventArgs const&) {
-        auto sel = m_fileGrid.SelectedItem();
-        if (!sel) {
-            m_previewImage.Source(nullptr);
-            m_previewText.Text(L"");
-            return;
-        }
-        auto fe = sel.try_as<FrameworkElement>();
-        std::wstring path;
-        if (fe) {
-            try { path = unbox_value<hstring>(fe.Tag()).c_str(); } catch (...) {}
-        }
-        if (path.empty()) return;
-        auto it = std::find_if(currentItems.begin(), currentItems.end(),
-            [&path](FileItem const& fi) { return fi.fullPath == path; });
-        if (it != currentItems.end()) {
-            // Show preview asynchronously
-            ShowPreview(*it);
-        }
-    }
-
-    fire_and_forget ShowPreview(FileItem const& fi) {
-        try {
-            if (fi.isFolder) {
-                m_previewImage.Source(nullptr);
-                m_previewText.Text(winrt::hstring(L"Folder: " + fi.name));
-                co_return;
-            }
-            auto path = fi.fullPath;
-            auto ext = std::filesystem::path(path).extension().wstring();
-            // simple image preview by extension
-            std::wstring extLower = ext;
-            std::transform(extLower.begin(), extLower.end(), extLower.begin(), ::towlower);
-            if (extLower == L".png" || extLower == L".jpg" || extLower == L".jpeg" || extLower == L".bmp" || extLower == L".gif") {
-                try {
-                    auto file = co_await StorageFile::GetFileFromPathAsync(hstring(path));
-                    auto stream = co_await file.OpenReadAsync();
-                    auto bitmap = winrt::Windows::UI::Xaml::Media::Imaging::BitmapImage();
-                    bitmap.SetSource(stream);
-                    m_previewImage.Source(bitmap);
-                    m_previewText.Text(winrt::hstring(L"Image: " + fi.name));
-                } catch (...) {
-                    m_previewImage.Source(nullptr);
-                    m_previewText.Text(winrt::hstring(L"Unable to preview image."));
-                }
-                co_return;
-            }
-
-            // text preview for small text files
-            if (extLower == L".txt" || extLower == L".csv" || extLower == L".log" || extLower == L".md") {
-                try {
-                    auto file = co_await StorageFile::GetFileFromPathAsync(hstring(path));
-                    auto text = co_await FileIO::ReadTextAsync(file);
-                    std::wstring preview;
-                    auto s = text.c_str();
-                    preview = s;
-                    if (preview.size() > 4000) preview = preview.substr(0, 4000) + L"...";
-                    m_previewImage.Source(nullptr);
-                    m_previewText.Text(winrt::hstring(preview));
-                } catch (...) {
-                    m_previewText.Text(winrt::hstring(L"Unable to load text preview."));
-                }
-                co_return;
-            }
-
-            // fallback: basic properties
-            std::wstringstream ss;
-            ss << L"Name: " << fi.name << L"\n";
-            ss << L"Path: " << fi.fullPath << L"\n";
-            ss << L"Size: " << fi.size << L" bytes\n";
-            // convert sys time to readable
-            SYSTEMTIME stUTC, stLocal;
-            FileTimeToSystemTime(&fi.modifiedTime, &stUTC);
-            SystemTimeToTzSpecificLocalTime(NULL, &stUTC, &stLocal);
-            ss << L"Modified: " << stLocal.wDay << L"." << stLocal.wMonth << L"." << stLocal.wYear;
-            m_previewImage.Source(nullptr);
-            m_previewText.Text(winrt::hstring(ss.str()));
-        } catch (...) {
-            m_previewText.Text(winrt::hstring(L"Preview error."));
-        }
     }
 
     // Breadcrumb helper
@@ -1021,7 +974,8 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
 
         ComboBox suggestionsCombo;
         for (auto const& s : suggestions) suggestionsCombo.Items().Append(box_value(winrt::hstring(s)));
-        suggestionsCombo.SelectionChanged([&input](auto const&, auto const&) {
+        // capture suggestionsCombo and input by reference so selection updates textbox
+        suggestionsCombo.SelectionChanged([&input, &suggestionsCombo](auto const&, auto const&) {
             auto sel = suggestionsCombo.SelectedItem();
             if (sel) input.Text(unbox_value<hstring>(sel));
         });
@@ -1056,27 +1010,24 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
     }
 
     // SuggestRename: show AI suggestions only (separate command), use same suggestion generator but show multiple choices
-    void SuggestRename(IInspectable const&, RoutedEventArgs const&) {
+    fire_and_forget SuggestRename(IInspectable const&, RoutedEventArgs const&) {
         std::wstring selPath = GetSelectedFullPath();
-        if (selPath.empty()) return;
+        if (selPath.empty()) co_return;
         auto it = FindItemByPath(selPath);
-        if (it == currentItems.end()) return;
+        if (it == currentItems.end()) co_return;
         FileItem fi = *it;
         auto suggestions = GenerateRenameSuggestions(fi);
         if (suggestions.empty()) {
-            ContentDialog dlg; dlg.Title(box_value(winrt::hstring(L"AI Vorschläge"))); TextBlock tb; tb.Text(winrt::hstring(L"No suggestions")); dlg.Content(tb); dlg.PrimaryButtonText(L"OK"); dlg.XamlRoot(m_fileGrid.XamlRoot()); dlg.ShowAsync();
-            return;
+            ContentDialog dlg; dlg.Title(box_value(winrt::hstring(L"AI Vorschläge"))); TextBlock tb; tb.Text(winrt::hstring(L"No suggestions")); dlg.Content(tb); dlg.PrimaryButtonText(L"OK"); dlg.XamlRoot(m_fileGrid.XamlRoot()); co_await dlg.ShowAsync(); co_return;
         }
-        // Show dialog with list of suggestions
         StackPanel sp; sp.Orientation(Orientation::Vertical);
         ComboBox cb; cb.PlaceholderText(L"Choose suggestion");
         for (auto const& s : suggestions) cb.Items().Append(box_value(winrt::hstring(s)));
         sp.Children().Append(cb);
         TextBlock note; note.Text(winrt::hstring(L"Select a suggestion and click Apply.")); note.Foreground(SolidColorBrush(Windows::UI::ColorHelper::FromArgb(255,190,190,190)));
         sp.Children().Append(note);
-
         ContentDialog dlg; dlg.Title(box_value(winrt::hstring(L"AI Rename Suggestions"))); dlg.Content(sp); dlg.PrimaryButtonText(L"Apply"); dlg.SecondaryButtonText(L"Cancel"); dlg.XamlRoot(m_fileGrid.XamlRoot());
-        auto res = dlg.ShowAsync().get();
+        auto res = co_await dlg.ShowAsync();
         if (res == ContentDialogResult::Primary) {
             auto sel = cb.SelectedItem();
             if (sel) {
@@ -1197,55 +1148,31 @@ struct ExplorerFinal : ApplicationT<ExplorerFinal>
 
     // Neue Methoden: Favoriten hinzufügen / entfernen
     void AddToFavorites(IInspectable const&, RoutedEventArgs const&) {
-        auto selectedItem = m_fileGrid.SelectedItem();
-        if (!selectedItem) return;
-
-        hstring name = unbox_value<hstring>(selectedItem);
-        auto it = std::find_if(currentItems.begin(), currentItems.end(),
-            [&name](FileItem const& fi) { return fi.name == name.c_str(); });
-
-        if (it != currentItems.end()) {
-            std::wstring pathToAdd;
-            if (it->isFolder) {
-                pathToAdd = it->fullPath;
-            } else {
-                // für Dateien: Ordner als Favorit speichern
-                std::filesystem::path p(it->fullPath);
-                pathToAdd = p.parent_path().wstring();
-            }
-
-            if (!pathToAdd.empty() &&
-                std::find(favorites.begin(), favorites.end(), pathToAdd) == favorites.end()) {
-                favorites.push_back(pathToAdd);
-                SaveFavorites();
-                PopulateSidebar();
-            }
+        std::wstring selPath = GetSelectedFullPath();
+        if (selPath.empty()) return;
+        auto it = FindItemByPath(selPath);
+        if (it == currentItems.end()) return;
+        std::wstring pathToAdd;
+        if (it->isFolder) pathToAdd = it->fullPath;
+        else pathToAdd = std::filesystem::path(it->fullPath).parent_path().wstring();
+        if (!pathToAdd.empty() && std::find(favorites.begin(), favorites.end(), pathToAdd) == favorites.end()) {
+            favorites.push_back(pathToAdd);
+            SaveFavorites();
+            PopulateSidebar();
         }
         m_fileGrid.SelectedItem(nullptr);
     }
 
     void RemoveFromFavorites(IInspectable const&, RoutedEventArgs const&) {
-        auto selectedItem = m_fileGrid.SelectedItem();
-        if (!selectedItem) return;
-
-        hstring name = unbox_value<hstring>(selectedItem);
-        auto it = std::find_if(currentItems.begin(), currentItems.end(),
-            [&name](FileItem const& fi) { return fi.name == name.c_str(); });
-
-        if (it != currentItems.end()) {
-            std::wstring pathToRemove;
-            if (it->isFolder) {
-                pathToRemove = it->fullPath;
-            } else {
-                std::filesystem::path p(it->fullPath);
-                pathToRemove = p.parent_path().wstring();
-            }
-
-            if (!pathToRemove.empty()) {
-                favorites.erase(std::remove(favorites.begin(), favorites.end(), pathToRemove), favorites.end());
-                SaveFavorites();
-                PopulateSidebar();
-            }
+        std::wstring selPath = GetSelectedFullPath();
+        if (selPath.empty()) return;
+        auto it = FindItemByPath(selPath);
+        if (it == currentItems.end()) return;
+        std::wstring pathToRemove = it->isFolder ? it->fullPath : std::filesystem::path(it->fullPath).parent_path().wstring();
+        if (!pathToRemove.empty()) {
+            favorites.erase(std::remove(favorites.begin(), favorites.end(), pathToRemove), favorites.end());
+            SaveFavorites();
+            PopulateSidebar();
         }
         m_fileGrid.SelectedItem(nullptr);
     }
